@@ -1,0 +1,13 @@
+[submodule "coll_synth/ccl2pp"]
+	path = coll_synth/ccl2pp
+	url = git@github.com:SetsuY/ccl2pp.git
+	branch = mscclpp_integration
+[submodule "simul/astra-sim"]
+	path = simul/astra-sim
+	url = git@github.com:astra-sim/astra-sim.git
+[submodule "simul/collectiveapi"]
+	path = simul/collectiveapi
+	url = https://github.com/astra-sim/collectiveapi
+[submodule "coll_synth/ccl2trace"]
+	path = coll_synth/ccl2trace
+	url = git@github.com:SetsuY/ccl2trace.git

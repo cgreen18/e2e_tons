@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "repository_root": "../..",
+  "output_directory": "generated/tons_128",
+  "topology_root": "topology_fixtures/tons_128",
+  "l3ss_binary": "coll_synth/l3ss_tree/target/release/l3ss_tree",
+  "binaries": {
+    "congestion_unaware": "simul/astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware",
+    "congestion_aware": "simul/astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware"
+  },
+  "remote_memory_configuration": "simul/astra-sim/examples/remote_memory/analytical/no_memory_expansion.json",
+  "ranks": 128,
+  "subchunks": 8,
+  "pmcf": {
+    "solver": "highs",
+    "candidate_policy": "cpl-safe",
+    "seed": 1
+  },
+  "sizes_bytes": [1048576, 16777216, 268435456],
+  "backends": ["congestion_unaware", "congestion_aware"],
+  "random_seed": 1,
+  "smoke": {"bytes_per_rank": 1048576, "subchunks": 1},
+  "network_profile": {
+    "clock_GHz": 1.0,
+    "bandwidth_GBps": 128.0,
+    "source_injection_ns": 25.0,
+    "electrical_edge_ns": 75.0,
+    "optical_edge_ns": 50.0
+  },
+  "topologies": {
+    "pt": {
+      "bundle": "pt-dor-128",
+      "route_policy": "destination-based dimension-order routing"
+    },
+    "pdtt": {
+      "bundle": "pdtt-128",
+      "route_policy": "CPL-safe destination-based MCLB with two VCs"
+    },
+    "tons": {
+      "bundle": "tons-128",
+      "route_policy": "CPL-safe destination-based MCLB with two VCs"
+    }
+  }
+}

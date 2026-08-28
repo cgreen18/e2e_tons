@@ -1,0 +1,104 @@
+diff --git a/chakra_converter/mscclang2chakra_converter.py b/chakra_converter/mscclang2chakra_converter.py
+index 56baed4d2e0207f86c1576387c63c4d8fdf6de47..9327a626898b7d80107454c46813282a12536303 100644
+--- a/chakra_converter/mscclang2chakra_converter.py
++++ b/chakra_converter/mscclang2chakra_converter.py
+@@ -92,6 +92,8 @@ class MSCCLSendStep(MSCCLStep):
+                                     int32_val=msg_chunk_idx))
+         node.attr.append(ChakraAttr(name="total_chunk_cnt",
+                                     int32_val=total_chunk_cnt))
++        node.attr.append(ChakraAttr(name="workload_chunk_cnt",
++                                    int32_val=total_chunk_cnt))
+         node.attr.append(ChakraAttr(name="local_time_step",
+                                     int32_val=step_id))
+         node.attr.append(ChakraAttr(name="chunk_offset",
+@@ -138,6 +140,8 @@ class MSCCLReceiveStep(MSCCLStep):
+                                     int32_val=msg_chunk_idx))
+         node.attr.append(ChakraAttr(name="total_chunk_cnt",
+                                     int32_val=total_chunk_cnt))
++        node.attr.append(ChakraAttr(name="workload_chunk_cnt",
++                                    int32_val=total_chunk_cnt))
+         node.attr.append(ChakraAttr(name="local_time_step",
+                                     int32_val=step_id))
+         node.attr.append(ChakraAttr(name="chunk_offset",
+@@ -185,6 +189,8 @@ class MSCCLReceiveReduceComputeStep(MSCCLStep):
+                                     int32_val=msg_chunk_idx))
+         recv_node.attr.append(ChakraAttr(name="total_chunk_cnt",
+                                     int32_val=total_chunk_cnt))
++        recv_node.attr.append(ChakraAttr(name="workload_chunk_cnt",
++                                    int32_val=total_chunk_cnt))
+         recv_node.attr.append(ChakraAttr(name="local_time_step",
+                                     int32_val=step_id))
+         recv_node.attr.append(ChakraAttr(name="chunk_offset",
+@@ -294,7 +300,7 @@ class MSCCL2ChakraConverter:
+         # Read the XML file and create ET Trace nodes. 
+         for gpu in root.findall('gpu'):
+             gpu_id = int(gpu.attrib['id'])
+-            total_chunk_cnt = int(gpu.attrib['i_chunks'])
++            total_chunk_cnt = int(root.attrib.get('input_chunks', gpu.attrib['i_chunks']))
+             if total_chunk_cnt == 0:
+                 total_chunk_cnt = int(gpu.attrib['o_chunks'])
+             node_map[gpu_id] = {}
+@@ -309,10 +315,11 @@ class MSCCL2ChakraConverter:
+                     msg_chunk_cnt = int(step.attrib['cnt'])
+                     src_off = int(step.attrib['srcoff'])
+                     dst_off = int(step.attrib['dstoff'])
+-                    if src_off != dst_off:
+-                        print(f"Error: At gpu {gpu_id} tb {tb_id} step {step} src_off {src_off} != dst_off {dst_off}")
+-                        exit()
+-                    msg_chunk_idx = src_off
++                    # Relays can move a logical chunk between input, scratch,
++                    # and output offsets.  Size resolution must use the stable
++                    # workload-level identity rather than requiring offsets to
++                    # be equal at every hop.
++                    msg_chunk_idx = int(step.attrib.get('logical_chunk', src_off))
+                     step_map[gpu_id][tb_id][step_id] = step
+                     et_node_id = self.get_et_node_id()
+                     if step.attrib['type'] == "s":
+@@ -331,9 +338,14 @@ class MSCCL2ChakraConverter:
+         # For each ET Trace node, add the parent dependency information
+         for gpu_id in node_map:
+             for tb_id in node_map[gpu_id]:
+-                # Note that we're doing this in reverse order within a threadblock.
++                previous_node = None
+                 for step_id, et_node in node_map[gpu_id][tb_id].items():
+                     if type(et_node) is MSCCLNopStep:
++                        step = step_map[gpu_id][tb_id][step_id]
++                        dep_tb_id = int(step.attrib['depid'])
++                        dep_step_id = int(step.attrib['deps'])
++                        if dep_tb_id != -1:
++                            previous_node = node_map[gpu_id][dep_tb_id][dep_step_id]
+                         continue
+                     step = step_map[gpu_id][tb_id][step_id]
+                     dep_tb_id = int(step.attrib['depid'])
+@@ -347,25 +359,12 @@ class MSCCL2ChakraConverter:
+                         except Exception as e:
+                             print(e, f'{gpu_id}, {dep_tb_id}, {dep_tb_id}, {tb_id}, {step_id}')
+ 
+-                    # Parent by control
+-                    if step_id != 0:
+-                        prev_step_id = step_id -1
+-                        #print(gpu_id, tb_id, prev_step_id, step_id)
+-                        prev_node = node_map[gpu_id][tb_id][prev_step_id]
+-                        while type(prev_node) is MSCCLNopStep:
+-                            prev_step = step_map[gpu_id][tb_id][prev_step_id]
+-                            dep_tb_id = int(prev_step.attrib['depid'])
+-                            dep_step_id = int(prev_step.attrib['deps'])
+-                            dep_node = node_map[gpu_id][dep_tb_id][dep_step_id]
+-                            et_node.add_parent(dep_node)
+-
+-                            prev_step_id = prev_step_id - 1
+-                            if prev_step_id < 0:
+-                                break
+-                            prev_node = node_map[gpu_id][tb_id][prev_step_id]
+-                        
+-                        if type(prev_node) is not MSCCLNopStep:
+-                            et_node.add_parent(prev_node)
++                    # XML step IDs may be global epochs and need not be
++                    # contiguous inside one threadblock. Preserve document
++                    # order instead of looking up step_id - 1.
++                    if previous_node is not None:
++                        et_node.add_parent(previous_node)
++                    previous_node = et_node
+         
+         # For each ET Trace node, add the parent dependency information
+         for gpu_id in node_map:

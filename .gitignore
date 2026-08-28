@@ -1,3 +1,15 @@
+topologies_and_routing/
+generated/
+*.et
+
+# Local absolute-path symlinks and the Python environment used on the cluster.
+# The committed topology fixture contains only the canonical 128-router inputs.
+topologies_and_routing
+ai_traces
+venv_py12/
+.DS_Store
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -1,0 +1,12 @@
+[package]
+name = "pipe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+graph = { path = "../graph" }
+petgraph = {workspace = true}
+log = {workspace = true}
+env_logger = {workspace = true}
+rand = "0.9.1"
+num = "0.4.3"

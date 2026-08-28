@@ -1,0 +1,432 @@
+diff --git a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc b/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
+index 8f3746ff50dd63d8055340e81f49e7ed5b74030c..77830fd4f7b7e9a920b7da017ff2c46f4e5a1259 100644
+--- a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
++++ b/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
+@@ -31,6 +31,8 @@ void CmdLineParser::define_options() noexcept {
+         cxxopts::value<std::string>()->default_value("empty"))(
+         "logging-folder", "Logging folder",
+         cxxopts::value<std::string>()->default_value("log"))(
++        "statistics-output", "Optional structured statistics JSON file",
++        cxxopts::value<std::string>()->default_value(""))(
+         "num-queues-per-dim", "Number of queues per each dimension",
+         cxxopts::value<int>()->default_value("1"))(
+         "compute-scale", "Compute scale",
+diff --git a/astra-sim/network_frontend/analytical/common/StructuredOutput.cc b/astra-sim/network_frontend/analytical/common/StructuredOutput.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cd45e78a382b973182a41678f6b4f008859fca4
+--- /dev/null
++++ b/astra-sim/network_frontend/analytical/common/StructuredOutput.cc
+@@ -0,0 +1,87 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#include "common/StructuredOutput.hh"
++
++#include <algorithm>
++#include <fstream>
++#include <iomanip>
++#include <stdexcept>
++#include <tuple>
++
++#include "astra-sim/system/Sys.hh"
++#include "astra-sim/workload/Statistics.hh"
++#include "astra-sim/workload/Workload.hh"
++
++using NetworkAnalyticalCongestionAware::DirectedLinkStatistics;
++
++namespace AstraSimAnalytical {
++
++void write_structured_statistics(
++    const std::string& filename,
++    const std::string& backend,
++    const AstraSim::Tick simulation_end,
++    const std::vector<AstraSim::Sys*>& systems,
++    const std::vector<DirectedLinkStatistics>& unsorted_links) {
++    if (filename.empty()) {
++        return;
++    }
++    std::ofstream output(filename);
++    if (!output) {
++        throw std::runtime_error("cannot open statistics output: " + filename);
++    }
++    const bool complete = std::all_of(
++        systems.begin(), systems.end(),
++        [](const AstraSim::Sys* system) { return system->workload->is_finished; });
++    output << "{\n  \"schema_version\": 1,\n"
++           << "  \"backend\": \"" << backend << "\",\n"
++           << "  \"simulation_end_ns\": " << simulation_end << ",\n"
++           << "  \"complete\": " << (complete ? "true" : "false") << ",\n"
++           << "  \"ranks\": [\n";
++    for (size_t rank = 0; rank < systems.size(); ++rank) {
++        const auto* workload = systems[rank]->workload;
++        const auto* stats = workload->stats;
++        using Type = AstraSim::Statistics::OperatorStatistics::OperatorType;
++        const auto compute = stats->get_type_time(Type::GPU);
++        const auto communication = stats->get_type_time(Type::COMM);
++        const auto overlap = stats->get_comp_comm_overlap();
++        const auto exposed = communication > overlap ? communication - overlap : 0;
++        output << "    {\"rank\": " << rank
++               << ", \"complete\": "
++               << (workload->is_finished ? "true" : "false")
++               << ", \"wall_time_ns\": " << stats->get_wall_time()
++               << ", \"compute_time_ns\": " << compute
++               << ", \"communication_time_ns\": " << communication
++               << ", \"exposed_communication_time_ns\": " << exposed
++               << ", \"overlap_time_ns\": " << overlap << "}"
++               << (rank + 1 == systems.size() ? "\n" : ",\n");
++    }
++    output << "  ],\n  \"links\": [\n";
++    auto links = unsorted_links;
++    std::sort(links.begin(), links.end(), [](const auto& left, const auto& right) {
++        return std::tie(left.src, left.dest) < std::tie(right.src, right.dest);
++    });
++    output << std::setprecision(10);
++    for (size_t index = 0; index < links.size(); ++index) {
++        const auto& link = links[index];
++        const double utilization = simulation_end == 0
++            ? 0.0
++            : static_cast<double>(link.serialization_busy_time) /
++                  static_cast<double>(simulation_end);
++        output << "    {\"src\": " << link.src << ", \"dst\": " << link.dest
++               << ", \"bytes\": " << link.transmitted_bytes
++               << ", \"chunks\": " << link.transmitted_chunks
++               << ", \"serialization_busy_ns\": " << link.serialization_busy_time
++               << ", \"queued_chunks\": " << link.queued_chunks
++               << ", \"total_queue_wait_ns\": " << link.total_queue_wait
++               << ", \"max_queue_wait_ns\": " << link.max_queue_wait
++               << ", \"maximum_queue_depth\": " << link.max_queue_depth
++               << ", \"utilization\": " << utilization << "}"
++               << (index + 1 == links.size() ? "\n" : ",\n");
++    }
++    output << "  ]\n}\n";
++}
++
++}  // namespace AstraSimAnalytical
+diff --git a/astra-sim/network_frontend/analytical/congestion_aware/main.cc b/astra-sim/network_frontend/analytical/congestion_aware/main.cc
+index d81686b30344658179b5d9ca97173be1598e9311..734409dbdbf1d0689b9f2d8612b79b6bdffa3b8c 100644
+--- a/astra-sim/network_frontend/analytical/congestion_aware/main.cc
++++ b/astra-sim/network_frontend/analytical/congestion_aware/main.cc
+@@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include "astra-sim/common/Logging.hh"
+ #include "common/CmdLineParser.hh"
++#include "common/StructuredOutput.hh"
+ #include "congestion_aware/CongestionAwareNetworkApi.hh"
+ #include <astra-network-analytical/common/EventQueue.h>
+ #include <astra-network-analytical/common/NetworkParser.h>
+@@ -38,6 +39,8 @@ int main(int argc, char* argv[]) {
+         cmd_line_parser.get<std::string>("logging-configuration");
+     const auto logging_folder =
+         cmd_line_parser.get<std::string>("logging-folder");
++    const auto statistics_output =
++        cmd_line_parser.get<std::string>("statistics-output");
+     const auto num_queues_per_dim =
+         cmd_line_parser.get<int>("num-queues-per-dim");
+     const auto comm_scale = cmd_line_parser.get<double>("comm-scale");
+@@ -100,6 +103,10 @@ int main(int argc, char* argv[]) {
+         event_queue->proceed();
+     }
+ 
++    write_structured_statistics(statistics_output, "congestion_aware",
++                                event_queue->get_current_time(), systems,
++                                topology->get_link_statistics());
++
+     for (auto it : systems) {
+         delete it;
+     }
+diff --git a/astra-sim/network_frontend/analytical/congestion_unaware/main.cc b/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
+index 64c578c450b750b241b431b989f1245dcdc0ea33..38ed1bbce9ef1987f0f4771c31ae6b0217a7bd25 100644
+--- a/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
++++ b/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
+@@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include "astra-sim/common/Logging.hh"
+ #include "common/CmdLineParser.hh"
++#include "common/StructuredOutput.hh"
+ #include "congestion_unaware/CongestionUnawareNetworkApi.hh"
+ #include <astra-network-analytical/common/EventQueue.h>
+ #include <astra-network-analytical/common/NetworkParser.h>
+@@ -38,6 +39,8 @@ int main(int argc, char* argv[]) {
+         cmd_line_parser.get<std::string>("logging-configuration");
+     const auto logging_folder =
+         cmd_line_parser.get<std::string>("logging-folder");
++    const auto statistics_output =
++        cmd_line_parser.get<std::string>("statistics-output");
+     const auto num_queues_per_dim =
+         cmd_line_parser.get<int>("num-queues-per-dim");
+     const auto comm_scale = cmd_line_parser.get<double>("comm-scale");
+@@ -99,6 +102,9 @@ int main(int argc, char* argv[]) {
+         event_queue->proceed();
+     }
+ 
++    write_structured_statistics(statistics_output, "congestion_unaware",
++                                event_queue->get_current_time(), systems);
++
+     for (auto it : systems) {
+         delete it;
+     }
+diff --git a/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh b/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..527f48f71fd2207a3629463be2f873cafb8ae49a
+--- /dev/null
++++ b/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh
+@@ -0,0 +1,28 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "astra-sim/common/Common.hh"
++#include "astra-network-analytical/congestion_aware/Type.h"
++
++namespace AstraSim {
++class Sys;
++}
++
++namespace AstraSimAnalytical {
++
++void write_structured_statistics(
++    const std::string& filename,
++    const std::string& backend,
++    AstraSim::Tick simulation_end,
++    const std::vector<AstraSim::Sys*>& systems,
++    const std::vector<NetworkAnalyticalCongestionAware::DirectedLinkStatistics>&
++        links = {});
++
++}  // namespace AstraSimAnalytical
+diff --git a/astra-sim/system/Sys.cc b/astra-sim/system/Sys.cc
+index d2a279b483e6ae5d190bc6936090edda92e2aea6..19bbfc89a5027614c65184fdb239483ec5ac9b9e 100644
+--- a/astra-sim/system/Sys.cc
++++ b/astra-sim/system/Sys.cc
+@@ -997,7 +997,10 @@ CollectivePhase Sys::generate_collective_phase(
+         return vn;
+     } else if (collective_impl->type == CollectiveImplType::CustomCollectiveImpl) {
+         string filename = ((CustomCollectiveImpl*)collective_impl)->filename;
+-        CollectivePhase vn(this, 0, new CustomAlgorithm(filename, id, queue_id, comm_group));
++        CollectivePhase vn(
++            this, 0,
++            new CustomAlgorithm(filename, id, data_size, queue_id, comm_group,
++                                this));
+         return vn;
+     } else {
+         LoggerFactory::get_logger("system")->critical(
+diff --git a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
+index e6351fb37460ff6d5f4f94bbedb7090bbc4d7636..1d9544d5a008e5c7b5a7ec342c6e9de2a408cd6a 100644
+--- a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
++++ b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
+@@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <algorithm>
+ 
+ #include "astra-sim/common/Logging.hh"
+ #include "astra-sim/system/RecvPacketEventHandlerData.hh"
+@@ -18,11 +19,22 @@ using namespace Chakra;
+ 
+ typedef ChakraProtoMsg::NodeType ChakraNodeType;
+ 
+-CustomAlgorithm::CustomAlgorithm(std::string et_filename, int id, int pos_in_comm, CommunicatorGroup* comm_group) : Algorithm() {
++CustomAlgorithm::CustomAlgorithm(std::string et_filename,
++                                 int id,
++                                 uint64_t data_size,
++                                 int pos_in_comm,
++                                 CommunicatorGroup* comm_group,
++                                 Sys* sys)
++    : Algorithm(),
++      et_filename(et_filename),
++      id(id),
++      comm_group(comm_group),
++      data_size(data_size),
++      sys(sys) {
+     try {
+-        et_filename = et_filename + "." + to_string(pos_in_comm) + ".et";
+-        this->et_feeder = new Chakra::FeederV3::ETFeeder(et_filename);
+-        this->comm_group = comm_group;
++        const auto rank_filename =
++            et_filename + "." + to_string(pos_in_comm) + ".et";
++        this->et_feeder = new Chakra::FeederV3::ETFeeder(rank_filename);
+     } catch (const std::runtime_error& e) {
+         // TODO(jinsun): Solve.
+         auto logger = AstraSim::LoggerFactory::get_logger("system::astraccl::custom_collectives");
+@@ -33,7 +45,69 @@ CustomAlgorithm::CustomAlgorithm(std::string et_filename, int id, int pos_in_com
+                      "We will find a way to avoid this issue in the future.");
+         std::exit(1);
+     }
+-    this->id = id;
++}
++
++uint64_t CustomAlgorithm::get_msg_size(
++    shared_ptr<Chakra::FeederV3::ETFeederNode> node) const {
++    auto logger = AstraSim::LoggerFactory::get_logger(
++        "system::astraccl::custom_collectives");
++    const auto legacy_size = [&]() -> uint64_t {
++        const uint64_t fallback = node->get_attr<uint64_t>("comm_size", 0);
++        if (fallback == 0) {
++            throw runtime_error(
++                "custom collective node is missing valid symbolic chunk "
++                "attributes and a positive comm_size fallback");
++        }
++        logger->warn(
++            "Custom schedule {} node {} uses deprecated hard-coded comm_size",
++            et_filename, node->id());
++        return fallback;
++    };
++    const bool has_workload_chunks = node->has_attr("workload_chunk_cnt");
++    const bool has_legacy_chunks = node->has_attr("total_chunk_cnt");
++    if (!node->has_attr("msg_chunk_cnt") ||
++        !node->has_attr("msg_chunk_idx") ||
++        (!has_workload_chunks && !has_legacy_chunks)) {
++        return legacy_size();
++    }
++
++    const int64_t message_chunks_raw = node->get_attr<int64_t>("msg_chunk_cnt");
++    const int64_t message_index_raw = node->get_attr<int64_t>("msg_chunk_idx");
++    int64_t workload_chunks_raw = has_workload_chunks
++        ? node->get_attr<int64_t>("workload_chunk_cnt")
++        : node->get_attr<int64_t>("total_chunk_cnt");
++    if (message_chunks_raw <= 0 || message_index_raw < 0 ||
++        workload_chunks_raw <= 0) {
++        return legacy_size();
++    }
++    const uint64_t message_chunks = static_cast<uint64_t>(message_chunks_raw);
++    const uint64_t message_index = static_cast<uint64_t>(message_index_raw);
++    uint64_t workload_chunks = static_cast<uint64_t>(workload_chunks_raw);
++
++    // Legacy all-gather converters described the full output layout.  New
++    // schedules explicitly describe the per-rank workload input layout.
++    if (!has_workload_chunks && this->comType == ComType::All_Gather) {
++        const uint64_t involved = comm_group == nullptr
++            ? static_cast<uint64_t>(sys->all_sys.size())
++            : static_cast<uint64_t>(comm_group->involved_NPUs.size());
++        if (involved == 0 || workload_chunks % involved != 0) {
++            throw runtime_error(
++                "legacy all-gather chunk count is not divisible by communicator size");
++        }
++        workload_chunks /= involved;
++    }
++    if (workload_chunks == 0 || message_chunks == 0 ||
++        message_index >= workload_chunks ||
++        message_chunks > workload_chunks - message_index) {
++        throw runtime_error("custom collective has an invalid logical chunk range");
++    }
++
++    const uint64_t base = data_size / workload_chunks;
++    const uint64_t remainder = data_size % workload_chunks;
++    const uint64_t end = message_index + message_chunks;
++    const uint64_t extras =
++        std::min(end, remainder) - std::min(message_index, remainder);
++    return base * message_chunks + extras;
+ }
+ 
+ int CustomAlgorithm::convert_algo_rank_to_real_rank(int algo_rank) {
+@@ -50,6 +124,7 @@ void CustomAlgorithm::issue(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
+     this->et_feeder->getDependancyResolver().take_node(node->id());
+     ChakraNodeType type = node->type();
+     if (type == ChakraNodeType::COMM_SEND_NODE) {
++        const uint64_t msg_size = get_msg_size(node);
+         sim_request snd_req;
+         int dst_rank = convert_algo_rank_to_real_rank(node->comm_dst());
+         snd_req.srcRank = node->comm_src(this->stream->owner->id);
+@@ -62,13 +137,11 @@ void CustomAlgorithm::issue(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
+         sehd->event = EventType::PacketSent;
+         stream->owner->front_end_sim_send(
+             0, Sys::dummy_data,
+-            // Note that we're using the comm size as hardcoded in the Impl
+-            // Chakra et, ed through the comm. api, and ignore the comm.size fed
+-            // in the workload chakra et. TODO: fix.
+-            node->comm_size(), UINT8, dst_rank, node->comm_tag(),
++            msg_size, UINT8, dst_rank, node->comm_tag(),
+             &snd_req, Sys::FrontEndSendRecvType::NATIVE, &Sys::handleEvent,
+             sehd);
+     } else if (type == ChakraNodeType::COMM_RECV_NODE) {
++        const uint64_t msg_size = get_msg_size(node);
+         sim_request rcv_req;
+         int src_rank = convert_algo_rank_to_real_rank(node->comm_src());
+         RecvPacketEventHandlerData* rcehd = new RecvPacketEventHandlerData;
+@@ -77,7 +150,7 @@ void CustomAlgorithm::issue(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
+         rcehd->custom_algorithm = this;
+         rcehd->event = EventType::PacketReceived;
+         stream->owner->front_end_sim_recv(
+-            0, Sys::dummy_data, node->comm_size(), UINT8, src_rank,
++            0, Sys::dummy_data, msg_size, UINT8, src_rank,
+             node->comm_tag(), &rcv_req, Sys::FrontEndSendRecvType::NATIVE,
+             &Sys::handleEvent, rcehd);
+     } else if (type == ChakraNodeType::COMP_NODE) {
+diff --git a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
+index 2893b5dec3578e40a22ce52dbbd941bbc24e336b..76fe8a3fe7df432f4b5b85f7ccde0669f1acdc20 100644
+--- a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
++++ b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
+@@ -17,6 +17,8 @@ LICENSE file in the root directory of this source tree.
+ 
+ namespace AstraSim {
+ 
++class Sys;
++
+ /*
+  * CustomAlgorithm class allows users to simulate their own custom algorithms.
+  * This class implements the Algorithm interface. The current implementation
+@@ -35,7 +37,12 @@ namespace AstraSim {
+  */
+ class CustomAlgorithm : public Algorithm {
+   public:
+-    CustomAlgorithm(std::string et_filename, int id, int pos_in_comm, CommunicatorGroup* comm_group);
++    CustomAlgorithm(std::string et_filename,
++                    int id,
++                    uint64_t data_size,
++                    int pos_in_comm,
++                    CommunicatorGroup* comm_group,
++                    Sys* sys);
+ 
+     // Runs the collective algorithm. This function is only called once to start
+     // the algorithm.
+@@ -55,6 +62,11 @@ class CustomAlgorithm : public Algorithm {
+      */
+     void issue(std::shared_ptr<Chakra::FeederV3::ETFeederNode> node);
+     void issue_dep_free_nodes();
++    uint64_t get_msg_size(
++        std::shared_ptr<Chakra::FeederV3::ETFeederNode> node) const;
++
++    // Path prefix of the per-rank schedule traces.
++    std::string et_filename;
+ 
+     // Rank Id
+     int id;
+@@ -63,6 +75,9 @@ class CustomAlgorithm : public Algorithm {
+     // to traverse the whole workload Chakra ET.
+     Chakra::ETFeeder* et_feeder;
+     CommunicatorGroup* comm_group;
++    // Bytes supplied by the invoking workload collective node.
++    uint64_t data_size;
++    Sys* sys;
+ };
+ 
+ }  // namespace AstraSim
+diff --git a/astra-sim/workload/Statistics.hh b/astra-sim/workload/Statistics.hh
+index 169c46ccf31d2ff97c0f2a95e68da65fa0b3e6d5..682b31772162033227ae031ef882e5dac8c853da 100644
+--- a/astra-sim/workload/Statistics.hh
++++ b/astra-sim/workload/Statistics.hh
+@@ -90,6 +90,16 @@ class Statistics {
+ 
+     void report() const;
+ 
++    [[nodiscard]] Tick get_wall_time() const noexcept { return wall_time; }
++    [[nodiscard]] Tick get_comp_comm_overlap() const noexcept {
++        return comp_comm_overlap;
++    }
++    [[nodiscard]] Tick get_type_time(
++        OperatorStatistics::OperatorType type) const noexcept {
++        const auto it = type_time.find(type);
++        return it == type_time.end() ? 0 : it->second;
++    }
++
+   private:
+     void extract_type_time();
+     Tick _calculateTotalRuntimeFromIntervals(

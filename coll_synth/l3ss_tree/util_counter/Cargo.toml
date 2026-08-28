@@ -1,0 +1,11 @@
+[package]
+name = "util_counter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+graph = { path = "../graph" }
+msccl_view = { path = "../msccl_view" }
+petgraph = {workspace = true}
+serde = { version = "1.0.219", features = ["derive"] }
+quick-xml = { version = "0.37.5", features = ["serialize"] }

@@ -1,0 +1,1267 @@
+diff --git a/common/GraphData.cpp b/common/GraphData.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..efafed079e58990adaa236e876385f8ed445e557
+--- /dev/null
++++ b/common/GraphData.cpp
+@@ -0,0 +1,226 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#include "common/GraphData.h"
++#include <algorithm>
++#include <cctype>
++#include <fstream>
++#include <iostream>
++#include <set>
++#include <sstream>
++
++using namespace NetworkAnalytical;
++
++namespace {
++std::string trim(const std::string& input) {
++    const auto first = std::find_if_not(input.begin(), input.end(), [](unsigned char c) {
++        return std::isspace(c);
++    });
++    const auto last = std::find_if_not(input.rbegin(), input.rend(), [](unsigned char c) {
++        return std::isspace(c);
++    }).base();
++    return first < last ? std::string(first, last) : std::string();
++}
++
++std::vector<std::string> split_csv(const std::string& line) {
++    std::vector<std::string> fields;
++    std::stringstream stream(line);
++    std::string field;
++    while (std::getline(stream, field, ',')) {
++        fields.push_back(trim(field));
++    }
++    return fields;
++}
++}  // namespace
++
++GraphData::GraphData(const NetworkParser& parser)
++    : npus_count(parser.get_npus_counts_per_dim().at(0)),
++      default_bandwidth(parser.get_bandwidths_per_dim().at(0)),
++      default_latency(parser.get_latencies_per_dim().at(0)),
++      injection_latency(parser.get_graph_injection_latency()) {
++    load_adjacency(parser.get_graph_adjacency_matrix_path());
++    for (int src = 0; src < npus_count; ++src) {
++        for (int dest = 0; dest < npus_count; ++dest) {
++            if (adjacency[src][dest] != 0) {
++                edge_properties[{src, dest}] = {default_bandwidth, default_latency};
++            }
++        }
++    }
++    if (parser.get_graph_edge_properties_path().has_value()) {
++        load_edge_properties(parser.get_graph_edge_properties_path().value());
++    }
++    load_routes(parser.get_graph_routing_paths_path());
++}
++
++int GraphData::get_npus_count() const noexcept {
++    return npus_count;
++}
++
++Bandwidth GraphData::get_default_bandwidth() const noexcept {
++    return default_bandwidth;
++}
++
++Latency GraphData::get_injection_latency() const noexcept {
++    return injection_latency;
++}
++
++const std::vector<std::vector<int>>& GraphData::get_adjacency() const noexcept {
++    return adjacency;
++}
++
++const std::vector<DeviceId>& GraphData::route(const DeviceId src, const DeviceId dest) const noexcept {
++    if (src < 0 || src >= npus_count || dest < 0 || dest >= npus_count) {
++        fail("route endpoint is outside graph");
++    }
++    return routes[static_cast<size_t>(src) * npus_count + dest];
++}
++
++const GraphEdgeProperties& GraphData::edge(const DeviceId src, const DeviceId dest) const noexcept {
++    const auto found = edge_properties.find({src, dest});
++    if (found == edge_properties.end()) {
++        fail("route references missing directed edge " + std::to_string(src) + " -> " + std::to_string(dest));
++    }
++    return found->second;
++}
++
++void GraphData::load_adjacency(const std::string& path) {
++    std::ifstream input(path);
++    if (!input) {
++        fail("cannot open adjacency matrix: " + path);
++    }
++    std::string line;
++    while (std::getline(input, line)) {
++        if (trim(line).empty()) {
++            continue;
++        }
++        std::stringstream row_stream(line);
++        std::vector<int> row;
++        int value;
++        while (row_stream >> value) {
++            if (value != 0 && value != 1) {
++                fail("adjacency entries must be zero or one");
++            }
++            row.push_back(value);
++        }
++        adjacency.push_back(std::move(row));
++    }
++    if (adjacency.size() != static_cast<size_t>(npus_count)) {
++        fail("adjacency row count does not match npus_count");
++    }
++    for (int src = 0; src < npus_count; ++src) {
++        if (adjacency[src].size() != static_cast<size_t>(npus_count)) {
++            fail("adjacency matrix is not square");
++        }
++        if (adjacency[src][src] != 0) {
++            fail("adjacency matrix must not contain self edges");
++        }
++    }
++}
++
++void GraphData::load_routes(const std::string& path) {
++    std::ifstream input(path);
++    if (!input) {
++        fail("cannot open routing paths: " + path);
++    }
++    std::string line;
++    std::vector<std::string> route_lines;
++    while (std::getline(input, line)) {
++        line = trim(line);
++        if (!line.empty()) {
++            route_lines.push_back(line);
++        }
++    }
++    if (!route_lines.empty() && route_lines.front().front() != '[') {
++        route_lines.erase(route_lines.begin());
++    }
++    const auto expected = static_cast<size_t>(npus_count) * npus_count;
++    if (route_lines.size() != expected) {
++        fail("routing file must contain exactly npus_count^2 source-major paths");
++    }
++    routes.reserve(expected);
++    for (size_t index = 0; index < route_lines.size(); ++index) {
++        std::string normalized = route_lines[index];
++        for (char& character : normalized) {
++            if (character == '[' || character == ']' || character == ',') {
++                character = ' ';
++            }
++        }
++        std::stringstream path_stream(normalized);
++        std::vector<DeviceId> route;
++        DeviceId node;
++        while (path_stream >> node) {
++            route.push_back(node);
++        }
++        const auto src = static_cast<DeviceId>(index / npus_count);
++        const auto dest = static_cast<DeviceId>(index % npus_count);
++        if (route.empty() || route.front() != src || route.back() != dest) {
++            fail("route endpoints do not match source-major position at " + std::to_string(src) + " -> " +
++                 std::to_string(dest));
++        }
++        std::set<DeviceId> visited;
++        for (const auto current : route) {
++            if (current < 0 || current >= npus_count || !visited.insert(current).second) {
++                fail("route contains an invalid or repeated device");
++            }
++        }
++        if (src == dest && route.size() != 1) {
++            fail("self route must contain only its endpoint");
++        }
++        for (size_t hop = 0; hop + 1 < route.size(); ++hop) {
++            (void)edge(route[hop], route[hop + 1]);
++        }
++        routes.push_back(std::move(route));
++    }
++}
++
++void GraphData::load_edge_properties(const std::string& path) {
++    std::ifstream input(path);
++    if (!input) {
++        fail("cannot open edge properties: " + path);
++    }
++    std::string line;
++    if (!std::getline(input, line)) {
++        fail("edge properties file is empty");
++    }
++    const auto header = split_csv(line);
++    auto column = [&](const std::string& name) -> size_t {
++        const auto found = std::find(header.begin(), header.end(), name);
++        if (found == header.end()) {
++            fail("edge properties is missing column " + name);
++        }
++        return static_cast<size_t>(std::distance(header.begin(), found));
++    };
++    const auto src_col = column("src");
++    const auto dest_col = column("dst");
++    const auto bandwidth_col = column("bandwidth_GBps");
++    const auto latency_col = column("latency_ns");
++    const auto max_col = std::max({src_col, dest_col, bandwidth_col, latency_col});
++    while (std::getline(input, line)) {
++        if (trim(line).empty()) {
++            continue;
++        }
++        const auto fields = split_csv(line);
++        if (fields.size() <= max_col) {
++            fail("edge properties row has too few columns");
++        }
++        try {
++            const auto src = std::stoi(fields[src_col]);
++            const auto dest = std::stoi(fields[dest_col]);
++            const auto bandwidth = std::stod(fields[bandwidth_col]);
++            const auto latency = std::stod(fields[latency_col]);
++            if (bandwidth <= 0 || latency < 0 || edge_properties.find({src, dest}) == edge_properties.end()) {
++                fail("edge properties contains an invalid or non-existent directed edge");
++            }
++            edge_properties[{src, dest}] = {bandwidth, latency};
++        } catch (const std::exception&) {
++            fail("edge properties contains a non-numeric value");
++        }
++    }
++}
++
++[[noreturn]] void GraphData::fail(const std::string& message) {
++    std::cerr << "[Error] (network/analytical/graph) " << message << std::endl;
++    std::exit(-1);
++}
+diff --git a/common/NetworkFunction.cpp b/common/NetworkFunction.cpp
+index 286b1235f724852dd3533efad92732cf8506dcde..dd0f6383b1a298bcdd4694f9245894554a2a9415 100644
+--- a/common/NetworkFunction.cpp
++++ b/common/NetworkFunction.cpp
+@@ -11,7 +11,6 @@ using namespace NetworkAnalytical;
+ Bandwidth NetworkAnalytical::bw_GBps_to_Bpns(const Bandwidth bw_GBps) noexcept {
+     assert(bw_GBps > 0);
+ 
+-    // 1 GB is 2^30 B
+-    // 1 s is 10^9 ns
+-    return bw_GBps * (1 << 30) / (1'000'000'000);  // GB/s to B/ns
++    // SI units: 1 GB/s is exactly 1 byte/ns.
++    return bw_GBps;
+ }
+diff --git a/common/network-parser/NetworkParser.cpp b/common/network-parser/NetworkParser.cpp
+index 51a9fbe25f0ca1e3fa5c774773e0f82a3583e72b..861618d4eb3dbed2b40d0771917203a8da5a66ae 100644
+--- a/common/network-parser/NetworkParser.cpp
++++ b/common/network-parser/NetworkParser.cpp
+@@ -9,7 +9,10 @@ LICENSE file in the root directory of this source tree.
+ 
+ using namespace NetworkAnalytical;
+ 
+-NetworkParser::NetworkParser(const std::string& path) noexcept : dims_count(-1) {
++NetworkParser::NetworkParser(const std::string& path) noexcept
++    : dims_count(-1),
++      config_dir(std::filesystem::absolute(path).parent_path()),
++      graph_injection_latency(0) {
+     // initialize values
+     npus_count_per_dim = {};
+     bandwidth_per_dim = {};
+@@ -63,6 +66,33 @@ std::vector<TopologyBuildingBlock> NetworkParser::get_topologies_per_dim() const
+     return topology_per_dim;
+ }
+ 
++const std::string& NetworkParser::get_graph_adjacency_matrix_path() const noexcept {
++    assert(!graph_adjacency_matrix_path.empty());
++    return graph_adjacency_matrix_path;
++}
++
++const std::string& NetworkParser::get_graph_routing_paths_path() const noexcept {
++    assert(!graph_routing_paths_path.empty());
++    return graph_routing_paths_path;
++}
++
++const std::optional<std::string>& NetworkParser::get_graph_edge_properties_path() const noexcept {
++    return graph_edge_properties_path;
++}
++
++Latency NetworkParser::get_graph_injection_latency() const noexcept {
++    assert(graph_injection_latency >= 0);
++    return graph_injection_latency;
++}
++
++std::string NetworkParser::resolve_path(const std::string& path) const noexcept {
++    const auto candidate = std::filesystem::path(path);
++    if (candidate.is_absolute()) {
++        return candidate.lexically_normal().string();
++    }
++    return (config_dir / candidate).lexically_normal().string();
++}
++
+ void NetworkParser::parse_network_config_yml(const YAML::Node& network_config) noexcept {
+     // parse topology_per_dim
+     const auto topology_names = parse_vector<std::string>(network_config["topology"]);
+@@ -79,6 +109,26 @@ void NetworkParser::parse_network_config_yml(const YAML::Node& network_config) n
+     bandwidth_per_dim = parse_vector<Bandwidth>(network_config["bandwidth"]);
+     latency_per_dim = parse_vector<Latency>(network_config["latency"]);
+ 
++    if (dims_count == 1 && topology_per_dim[0] == TopologyBuildingBlock::Graph) {
++        const auto graph = network_config["graph"];
++        if (!graph || !graph["adjacency-matrix"] || !graph["routing-paths"]) {
++            std::cerr << "[Error] (network/analytical) Graph requires graph.adjacency-matrix and graph.routing-paths"
++                      << std::endl;
++            std::exit(-1);
++        }
++        graph_adjacency_matrix_path =
++            resolve_path(graph["adjacency-matrix"].as<std::string>());
++        graph_routing_paths_path =
++            resolve_path(graph["routing-paths"].as<std::string>());
++        if (graph["edge-properties"]) {
++            graph_edge_properties_path =
++                resolve_path(graph["edge-properties"].as<std::string>());
++        }
++        if (graph["injection-latency"]) {
++            graph_injection_latency = graph["injection-latency"].as<Latency>();
++        }
++    }
++
+     // check the validity of the parsed network config
+     check_validity();
+ }
+@@ -98,6 +148,10 @@ TopologyBuildingBlock NetworkParser::parse_topology_name(const std::string& topo
+         return TopologyBuildingBlock::Switch;
+     }
+ 
++    if (topology_name == "Graph") {
++        return TopologyBuildingBlock::Graph;
++    }
++
+     // shouldn't reach here
+     std::cerr << "[Error] (network/analytical) " << "Topology name " << topology_name << " not supported" << std::endl;
+     std::exit(-1);
+@@ -149,4 +203,9 @@ void NetworkParser::check_validity() const noexcept {
+             std::exit(-1);
+         }
+     }
++
++    if (graph_injection_latency < 0) {
++        std::cerr << "[Error] (network/analytical) graph injection latency must be non-negative" << std::endl;
++        std::exit(-1);
++    }
+ }
+diff --git a/congestion_aware/network/Device.cpp b/congestion_aware/network/Device.cpp
+index 5ba6ecaf9754b626f2caf0b669e19c40dd2d0ecf..984dbee4328b7c104f6cb9934dc13a0524fd18fc 100644
+--- a/congestion_aware/network/Device.cpp
++++ b/congestion_aware/network/Device.cpp
+@@ -54,6 +54,19 @@ void Device::connect(const DeviceId id, const Bandwidth bandwidth, const Latency
+     links[id] = std::make_shared<Link>(bandwidth, latency);
+ }
+ 
++std::vector<DirectedLinkStatistics> Device::get_link_statistics() const noexcept {
++    std::vector<DirectedLinkStatistics> result;
++    result.reserve(links.size());
++    for (const auto& [dest, link] : links) {
++        DirectedLinkStatistics entry;
++        static_cast<LinkStatistics&>(entry) = link->get_statistics();
++        entry.src = device_id;
++        entry.dest = dest;
++        result.push_back(entry);
++    }
++    return result;
++}
++
+ bool Device::connected(const DeviceId dest) const noexcept {
+     assert(dest >= 0);
+ 
+diff --git a/congestion_aware/network/Link.cpp b/congestion_aware/network/Link.cpp
+index 6149a0b011cbe0817fe942a1144ce8b22dec492f..0b6c3924c914e39162e030a6cf97a83012ccde5a 100644
+--- a/congestion_aware/network/Link.cpp
++++ b/congestion_aware/network/Link.cpp
+@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
+ #include "common/NetworkFunction.h"
+ #include "congestion_aware/Chunk.h"
+ #include "congestion_aware/Device.h"
++#include <algorithm>
+ #include <cassert>
+ 
+ using namespace NetworkAnalytical;
+@@ -41,7 +42,8 @@ Link::Link(const Bandwidth bandwidth, const Latency latency) noexcept
+     : bandwidth(bandwidth),
+       latency(latency),
+       pending_chunks(),
+-      busy(false) {
++      busy(false),
++      statistics() {
+     assert(bandwidth > 0);
+     assert(latency >= 0);
+ 
+@@ -54,7 +56,10 @@ void Link::send(std::unique_ptr<Chunk> chunk) noexcept {
+ 
+     if (busy) {
+         // link is busy, add to pending chunks
+-        pending_chunks.push_back(std::move(chunk));
++        pending_chunks.push_back({std::move(chunk), event_queue->get_current_time()});
++        statistics.queued_chunks++;
++        statistics.max_queue_depth =
++            std::max(statistics.max_queue_depth, pending_chunks.size());
+     } else {
+         // service this chunk immediately
+         schedule_chunk_transmission(std::move(chunk));
+@@ -66,11 +71,15 @@ void Link::process_pending_transmission() noexcept {
+     assert(pending_chunk_exists());
+ 
+     // get chunk to process
+-    auto chunk = std::move(pending_chunks.front());
++    auto pending = std::move(pending_chunks.front());
+     pending_chunks.pop_front();
+ 
++    const auto wait = event_queue->get_current_time() - pending.enqueue_time;
++    statistics.total_queue_wait += wait;
++    statistics.max_queue_wait = std::max(statistics.max_queue_wait, wait);
++
+     // service this chunk
+-    schedule_chunk_transmission(std::move(chunk));
++    schedule_chunk_transmission(std::move(pending.chunk));
+ }
+ 
+ bool Link::pending_chunk_exists() const noexcept {
+@@ -88,6 +97,10 @@ void Link::set_free() noexcept {
+     busy = false;
+ }
+ 
++const LinkStatistics& Link::get_statistics() const noexcept {
++    return statistics;
++}
++
+ EventTime Link::serialization_delay(const ChunkSize chunk_size) const noexcept {
+     assert(chunk_size > 0);
+ 
+@@ -129,6 +142,9 @@ void Link::schedule_chunk_transmission(std::unique_ptr<Chunk> chunk) noexcept {
+ 
+     // schedule link free time
+     const auto serialization_time = serialization_delay(chunk_size);
++    statistics.transmitted_bytes += chunk_size;
++    statistics.transmitted_chunks++;
++    statistics.serialization_busy_time += serialization_time;
+     const auto link_free_time = current_time + serialization_time;
+     auto* const link_ptr = static_cast<void*>(this);
+     Link::event_queue->schedule_event(link_free_time, link_become_free, link_ptr);
+diff --git a/congestion_aware/topology/Graph.cpp b/congestion_aware/topology/Graph.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..56afff5c639652f8606a6ee4925e811ef488d199
+--- /dev/null
++++ b/congestion_aware/topology/Graph.cpp
+@@ -0,0 +1,43 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#include "congestion_aware/Graph.h"
++
++using namespace NetworkAnalytical;
++using namespace NetworkAnalyticalCongestionAware;
++
++Graph::Graph(const NetworkParser& parser) : graph(parser) {
++    npus_count = graph.get_npus_count();
++    devices_count = npus_count;
++    dims_count = 1;
++    npus_count_per_dim = {npus_count};
++    bandwidth_per_dim = {graph.get_default_bandwidth()};
++    instantiate_devices();
++    const auto& adjacency = graph.get_adjacency();
++    for (int src = 0; src < npus_count; ++src) {
++        for (int dest = 0; dest < npus_count; ++dest) {
++            if (adjacency[src][dest] != 0) {
++                const auto& properties = graph.edge(src, dest);
++                connect(src, dest, properties.bandwidth, properties.latency, false);
++            }
++        }
++    }
++}
++
++Route Graph::route(const DeviceId src, const DeviceId dest) const noexcept {
++    Route route;
++    for (const auto device : graph.route(src, dest)) {
++        route.push_back(devices[device]);
++    }
++    return route;
++}
++
++Latency Graph::get_injection_latency() const noexcept {
++    return graph.get_injection_latency();
++}
++
++const GraphData& Graph::get_graph_data() const noexcept {
++    return graph;
++}
+diff --git a/congestion_aware/topology/Helper.cpp b/congestion_aware/topology/Helper.cpp
+index cf719a3971f5c93b9601ed1f99420ee536d760a4..7da76e61c45b7900544d0afe51398b1f2e6a442e 100644
+--- a/congestion_aware/topology/Helper.cpp
++++ b/congestion_aware/topology/Helper.cpp
+@@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include "congestion_aware/Helper.h"
+ #include "congestion_aware/FullyConnected.h"
++#include "congestion_aware/Graph.h"
+ #include "congestion_aware/Ring.h"
+ #include "congestion_aware/Switch.h"
+ #include <cstdlib>
+@@ -41,6 +42,8 @@ std::shared_ptr<Topology> NetworkAnalyticalCongestionAware::construct_topology(
+         return std::make_shared<Switch>(npus_count, bandwidth, latency);
+     case TopologyBuildingBlock::FullyConnected:
+         return std::make_shared<FullyConnected>(npus_count, bandwidth, latency);
++    case TopologyBuildingBlock::Graph:
++        return std::make_shared<Graph>(network_parser);
+     default:
+         // shouldn't reaach here
+         std::cerr << "[Error] (network/analytical/congestion_aware) " << "not supported basic-topology" << std::endl;
+diff --git a/congestion_aware/topology/Topology.cpp b/congestion_aware/topology/Topology.cpp
+index 0aa326c380847213fc57a2fb852f1fde94ad2e73..79f0cdef65cb8235a73a4a10b231d8e83de089da 100644
+--- a/congestion_aware/topology/Topology.cpp
++++ b/congestion_aware/topology/Topology.cpp
+@@ -9,10 +9,20 @@ LICENSE file in the root directory of this source tree.
+ 
+ using namespace NetworkAnalyticalCongestionAware;
+ 
++std::shared_ptr<EventQueue> Topology::event_queue;
++
++void Topology::start_transmission(void* const chunk_ptr) noexcept {
++    assert(chunk_ptr != nullptr);
++    auto chunk = std::unique_ptr<Chunk>(static_cast<Chunk*>(chunk_ptr));
++    const auto src = chunk->current_device();
++    src->send(std::move(chunk));
++}
++
+ void Topology::set_event_queue(std::shared_ptr<EventQueue> event_queue) noexcept {
+     assert(event_queue != nullptr);
+ 
+     // pass the given event_queue to Link
++    Topology::event_queue = event_queue;
+     Link::set_event_queue(std::move(event_queue));
+ }
+ 
+@@ -54,6 +64,19 @@ std::vector<Bandwidth> Topology::get_bandwidth_per_dim() const noexcept {
+     return bandwidth_per_dim;
+ }
+ 
++std::vector<DirectedLinkStatistics> Topology::get_link_statistics() const noexcept {
++    std::vector<DirectedLinkStatistics> result;
++    for (const auto& device : devices) {
++        auto device_stats = device->get_link_statistics();
++        result.insert(result.end(), device_stats.begin(), device_stats.end());
++    }
++    return result;
++}
++
++Latency Topology::get_injection_latency() const noexcept {
++    return 0;
++}
++
+ void Topology::send(std::unique_ptr<Chunk> chunk) noexcept {
+     assert(chunk != nullptr);
+ 
+@@ -63,8 +86,16 @@ void Topology::send(std::unique_ptr<Chunk> chunk) noexcept {
+     // assert src is valid
+     assert(0 <= src && src < devices_count);
+ 
+-    // initiate transmission from src
+-    devices[src]->send(std::move(chunk));
++    const auto injection_latency = get_injection_latency();
++    if (injection_latency == 0) {
++        devices[src]->send(std::move(chunk));
++        return;
++    }
++    assert(event_queue != nullptr);
++    const auto start_time = event_queue->get_current_time() +
++                            static_cast<EventTime>(injection_latency);
++    auto* const chunk_ptr = static_cast<void*>(chunk.release());
++    event_queue->schedule_event(start_time, start_transmission, chunk_ptr);
+ }
+ 
+ void Topology::connect(const DeviceId src,
+diff --git a/congestion_unaware/topology/Graph.cpp b/congestion_unaware/topology/Graph.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..af8d39477c8cc46d65880e56234f06998c5a50de
+--- /dev/null
++++ b/congestion_unaware/topology/Graph.cpp
+@@ -0,0 +1,39 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#include "congestion_unaware/Graph.h"
++#include "common/NetworkFunction.h"
++#include <algorithm>
++#include <cassert>
++#include <limits>
++
++using namespace NetworkAnalytical;
++using namespace NetworkAnalyticalCongestionUnaware;
++
++Graph::Graph(const NetworkParser& parser) : graph(parser) {
++    npus_count = graph.get_npus_count();
++    dims_count = 1;
++    npus_count_per_dim = {npus_count};
++    bandwidth_per_dim = {graph.get_default_bandwidth()};
++}
++
++EventTime Graph::send(const DeviceId src, const DeviceId dest, const ChunkSize chunk_size) const noexcept {
++    assert(src != dest);
++    assert(chunk_size > 0);
++    const auto& path = graph.route(src, dest);
++    auto latency = graph.get_injection_latency();
++    auto bottleneck_bandwidth = std::numeric_limits<Bandwidth>::max();
++    for (size_t hop = 0; hop + 1 < path.size(); ++hop) {
++        const auto& properties = graph.edge(path[hop], path[hop + 1]);
++        latency += properties.latency;
++        bottleneck_bandwidth = std::min(bottleneck_bandwidth, properties.bandwidth);
++    }
++    const auto serialization = static_cast<double>(chunk_size) / bw_GBps_to_Bpns(bottleneck_bandwidth);
++    return static_cast<EventTime>(latency + serialization);
++}
++
++const GraphData& Graph::get_graph_data() const noexcept {
++    return graph;
++}
+diff --git a/congestion_unaware/topology/Helper.cpp b/congestion_unaware/topology/Helper.cpp
+index f0e932ec79a4c3e72fd747c22a282cf356e36495..34283dd5f1f3678d2223d261289828c6b4c5939a 100644
+--- a/congestion_unaware/topology/Helper.cpp
++++ b/congestion_unaware/topology/Helper.cpp
+@@ -6,6 +6,7 @@ LICENSE file in the root directory of this source tree.
+ #include "congestion_unaware/Helper.h"
+ #include "congestion_unaware/BasicTopology.h"
+ #include "congestion_unaware/FullyConnected.h"
++#include "congestion_unaware/Graph.h"
+ #include "congestion_unaware/MultiDimTopology.h"
+ #include "congestion_unaware/Ring.h"
+ #include "congestion_unaware/Switch.h"
+@@ -40,6 +41,8 @@ std::shared_ptr<Topology> NetworkAnalyticalCongestionUnaware::construct_topology
+             return std::make_shared<Switch>(npus_count, bandwidth, latency);
+         case TopologyBuildingBlock::FullyConnected:
+             return std::make_shared<FullyConnected>(npus_count, bandwidth, latency);
++        case TopologyBuildingBlock::Graph:
++            return std::make_shared<Graph>(network_parser);
+         default:
+             // shouldn't reach here
+             std::cerr << "[Error] (network/analytical/congestion_unaware)" << "Not supported topology" << std::endl;
+@@ -70,6 +73,10 @@ std::shared_ptr<Topology> NetworkAnalyticalCongestionUnaware::construct_topology
+         case TopologyBuildingBlock::FullyConnected:
+             dim_topology = std::make_unique<FullyConnected>(npus_count, bandwidth, latency);
+             break;
++        case TopologyBuildingBlock::Graph:
++            std::cerr << "[Error] (network/analytical/congestion_unaware) Graph must be the only dimension"
++                      << std::endl;
++            std::exit(-1);
+         default:
+             // shouldn't reach here
+             std::cerr << "[Error] (network/analytical/congestion_unaware)" << "Not supported basic-topology"
+diff --git a/include/astra-network-analytical/common/GraphData.h b/include/astra-network-analytical/common/GraphData.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..44db5cf72d885a53f43a90861ea7b351bf879616
+--- /dev/null
++++ b/include/astra-network-analytical/common/GraphData.h
+@@ -0,0 +1,48 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#pragma once
++
++#include "common/NetworkParser.h"
++#include "common/Type.h"
++#include <map>
++#include <utility>
++#include <vector>
++
++namespace NetworkAnalytical {
++
++struct GraphEdgeProperties {
++    Bandwidth bandwidth;
++    Latency latency;
++};
++
++/** Parsed and validated arbitrary-topology inputs shared by both backends. */
++class GraphData {
++  public:
++    explicit GraphData(const NetworkParser& parser);
++
++    [[nodiscard]] int get_npus_count() const noexcept;
++    [[nodiscard]] Bandwidth get_default_bandwidth() const noexcept;
++    [[nodiscard]] Latency get_injection_latency() const noexcept;
++    [[nodiscard]] const std::vector<std::vector<int>>& get_adjacency() const noexcept;
++    [[nodiscard]] const std::vector<DeviceId>& route(DeviceId src, DeviceId dest) const noexcept;
++    [[nodiscard]] const GraphEdgeProperties& edge(DeviceId src, DeviceId dest) const noexcept;
++
++  private:
++    int npus_count;
++    Bandwidth default_bandwidth;
++    Latency default_latency;
++    Latency injection_latency;
++    std::vector<std::vector<int>> adjacency;
++    std::vector<std::vector<DeviceId>> routes;
++    std::map<std::pair<DeviceId, DeviceId>, GraphEdgeProperties> edge_properties;
++
++    void load_adjacency(const std::string& path);
++    void load_routes(const std::string& path);
++    void load_edge_properties(const std::string& path);
++    [[noreturn]] static void fail(const std::string& message);
++};
++
++}  // namespace NetworkAnalytical
+diff --git a/include/astra-network-analytical/common/NetworkFunction.h b/include/astra-network-analytical/common/NetworkFunction.h
+index 99d2211d87c66666f868fa1a2889479b05b81599..d21af0caa0c20ae83f9e71d7049d5d0c4f43c9bd 100644
+--- a/include/astra-network-analytical/common/NetworkFunction.h
++++ b/include/astra-network-analytical/common/NetworkFunction.h
+@@ -11,8 +11,7 @@ namespace NetworkAnalytical {
+ 
+ /**
+  * Convert bandwidth from GB/s to B/ns.
+- * Here, 1 GB = 2^30 B
+- * 1 s = 10^9 ns
++ * Uses SI GB: 1 GB/s is exactly 1 B/ns.
+  *
+  * @param bw_GBps bandwidth in GB/s
+  * @return translated bandwidth in B/ns
+diff --git a/include/astra-network-analytical/common/NetworkParser.h b/include/astra-network-analytical/common/NetworkParser.h
+index d0e216384f44e18d804f78aa06baf1179588ce62..50cf6cf50d3c3c13261db0038e588aa129c1679c 100644
+--- a/include/astra-network-analytical/common/NetworkParser.h
++++ b/include/astra-network-analytical/common/NetworkParser.h
+@@ -6,7 +6,9 @@ LICENSE file in the root directory of this source tree.
+ #pragma once
+ 
+ #include "common/Type.h"
++#include <filesystem>
+ #include <iostream>
++#include <optional>
+ #include <yaml-cpp/yaml.h>
+ 
+ namespace NetworkAnalytical {
+@@ -60,6 +62,12 @@ class NetworkParser {
+      */
+     [[nodiscard]] std::vector<TopologyBuildingBlock> get_topologies_per_dim() const noexcept;
+ 
++    /** Graph-only configuration. Paths are resolved relative to the YAML. */
++    [[nodiscard]] const std::string& get_graph_adjacency_matrix_path() const noexcept;
++    [[nodiscard]] const std::string& get_graph_routing_paths_path() const noexcept;
++    [[nodiscard]] const std::optional<std::string>& get_graph_edge_properties_path() const noexcept;
++    [[nodiscard]] Latency get_graph_injection_latency() const noexcept;
++
+   private:
+     /// number of network dimensions
+     int dims_count;
+@@ -76,6 +84,14 @@ class NetworkParser {
+     /// topology building block per each dimension
+     std::vector<TopologyBuildingBlock> topology_per_dim;
+ 
++    std::filesystem::path config_dir;
++    std::string graph_adjacency_matrix_path;
++    std::string graph_routing_paths_path;
++    std::optional<std::string> graph_edge_properties_path;
++    Latency graph_injection_latency;
++
++    [[nodiscard]] std::string resolve_path(const std::string& path) const noexcept;
++
+     /**
+      * Parse topology name (in string) into TopologyBuildingBlock enum
+      *
+diff --git a/include/astra-network-analytical/common/Type.h b/include/astra-network-analytical/common/Type.h
+index b18e70a2bcf3a9064f549f85f8b602a85e18de78..dd64fb44967e4ff683992a99e66537bbe88abec7 100644
+--- a/include/astra-network-analytical/common/Type.h
++++ b/include/astra-network-analytical/common/Type.h
+@@ -31,6 +31,12 @@ using Latency = double;
+ using EventTime = uint64_t;
+ 
+ /// Basic multi-dimensional topology building blocks
+-enum class TopologyBuildingBlock { Undefined, Ring, FullyConnected, Switch };
++enum class TopologyBuildingBlock {
++    Undefined,
++    Ring,
++    FullyConnected,
++    Switch,
++    Graph
++};
+ 
+ }  // namespace NetworkAnalytical
+diff --git a/include/astra-network-analytical/congestion_aware/Device.h b/include/astra-network-analytical/congestion_aware/Device.h
+index 7dd6ee51806c1159bf64fda6240303751fbba3e9..c5a08f83c23086020aace6455f846fe4d19c125e 100644
+--- a/include/astra-network-analytical/congestion_aware/Device.h
++++ b/include/astra-network-analytical/congestion_aware/Device.h
+@@ -9,6 +9,7 @@ LICENSE file in the root directory of this source tree.
+ #include "congestion_aware/Type.h"
+ #include <map>
+ #include <memory>
++#include <vector>
+ 
+ using namespace NetworkAnalytical;
+ 
+@@ -51,6 +52,8 @@ class Device {
+      */
+     void connect(DeviceId id, Bandwidth bandwidth, Latency latency) noexcept;
+ 
++    [[nodiscard]] std::vector<DirectedLinkStatistics> get_link_statistics() const noexcept;
++
+   private:
+     /// device Id
+     DeviceId device_id;
+diff --git a/include/astra-network-analytical/congestion_aware/Graph.h b/include/astra-network-analytical/congestion_aware/Graph.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..55e19a0798164be8ad6d830ee2560b95a89ce330
+--- /dev/null
++++ b/include/astra-network-analytical/congestion_aware/Graph.h
+@@ -0,0 +1,24 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#pragma once
++
++#include "common/GraphData.h"
++#include "congestion_aware/Topology.h"
++
++namespace NetworkAnalyticalCongestionAware {
++
++class Graph final : public Topology {
++  public:
++    explicit Graph(const NetworkParser& parser);
++    [[nodiscard]] Route route(DeviceId src, DeviceId dest) const noexcept override;
++    [[nodiscard]] Latency get_injection_latency() const noexcept override;
++    [[nodiscard]] const GraphData& get_graph_data() const noexcept;
++
++  private:
++    GraphData graph;
++};
++
++}  // namespace NetworkAnalyticalCongestionAware
+diff --git a/include/astra-network-analytical/congestion_aware/Link.h b/include/astra-network-analytical/congestion_aware/Link.h
+index 4041e330faf7f3cb6395473da1d8ebcd756b3b2f..6d0549e2ee0a1c60389a8d14b0bab47ae097105d 100644
+--- a/include/astra-network-analytical/congestion_aware/Link.h
++++ b/include/astra-network-analytical/congestion_aware/Link.h
+@@ -75,6 +75,8 @@ class Link {
+      */
+     void set_free() noexcept;
+ 
++    [[nodiscard]] const LinkStatistics& get_statistics() const noexcept;
++
+   private:
+     /// event queue Link uses to schedule events
+     static std::shared_ptr<EventQueue> event_queue;
+@@ -89,11 +91,17 @@ class Link {
+     Latency latency;
+ 
+     /// queue of pending chunks
+-    std::list<std::unique_ptr<Chunk>> pending_chunks;
++    struct PendingChunk {
++        std::unique_ptr<Chunk> chunk;
++        EventTime enqueue_time;
++    };
++    std::list<PendingChunk> pending_chunks;
+ 
+     /// flag to indicate if the link is busy
+     bool busy;
+ 
++    LinkStatistics statistics;
++
+     /**
+      * Compute the serialization delay of a chunk on the link.
+      * i.e., serialization delay = (chunk size) / (link bandwidth)
+diff --git a/include/astra-network-analytical/congestion_aware/Topology.h b/include/astra-network-analytical/congestion_aware/Topology.h
+index 20056d49776bdcdfcab5633f908bf9480e6198ef..3a6f067e4a8b95089dfb7cc688d8dc1c14654eae 100644
+--- a/include/astra-network-analytical/congestion_aware/Topology.h
++++ b/include/astra-network-analytical/congestion_aware/Topology.h
+@@ -46,6 +46,9 @@ class Topology {
+      */
+     [[nodiscard]] virtual Route route(DeviceId src, DeviceId dest) const noexcept = 0;
+ 
++    /** One-time source injection latency. Basic topologies default to zero. */
++    [[nodiscard]] virtual Latency get_injection_latency() const noexcept;
++
+     /**
+      * Initiate a transmission of a chunk.
+      *
+@@ -90,7 +93,11 @@ class Topology {
+      */
+     [[nodiscard]] std::vector<Bandwidth> get_bandwidth_per_dim() const noexcept;
+ 
++    [[nodiscard]] std::vector<DirectedLinkStatistics> get_link_statistics() const noexcept;
++
+   protected:
++    /// event queue used for optional source injection delay
++    static std::shared_ptr<EventQueue> event_queue;
+     /// number of total devices in the topology
+     /// device includes non-NPU devices such as switches
+     int devices_count;
+@@ -129,6 +136,9 @@ class Topology {
+      * @param bidirectional true if connection is bidirectional, false otherwise
+      */
+     void connect(DeviceId src, DeviceId dest, Bandwidth bandwidth, Latency latency, bool bidirectional = true) noexcept;
++
++  private:
++    static void start_transmission(void* chunk_ptr) noexcept;
+ };
+ 
+ }  // namespace NetworkAnalyticalCongestionAware
+diff --git a/include/astra-network-analytical/congestion_aware/Type.h b/include/astra-network-analytical/congestion_aware/Type.h
+index 331530d0f705f413a506932cef21ba01eef2dd84..e38a9f0f0650584250eb2d39c1983e083e967c03 100644
+--- a/include/astra-network-analytical/congestion_aware/Type.h
++++ b/include/astra-network-analytical/congestion_aware/Type.h
+@@ -7,6 +7,8 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include <list>
+ #include <memory>
++#include <cstddef>
++#include "common/Type.h"
+ 
+ namespace NetworkAnalyticalCongestionAware {
+ 
+@@ -18,4 +20,19 @@ class Device;
+ /// Route is a list of devices
+ using Route = std::list<std::shared_ptr<Device>>;
+ 
++struct LinkStatistics {
++    uint64_t transmitted_bytes = 0;
++    uint64_t transmitted_chunks = 0;
++    uint64_t queued_chunks = 0;
++    NetworkAnalytical::EventTime serialization_busy_time = 0;
++    NetworkAnalytical::EventTime total_queue_wait = 0;
++    NetworkAnalytical::EventTime max_queue_wait = 0;
++    size_t max_queue_depth = 0;
++};
++
++struct DirectedLinkStatistics : public LinkStatistics {
++    NetworkAnalytical::DeviceId src = -1;
++    NetworkAnalytical::DeviceId dest = -1;
++};
++
+ }  // namespace NetworkAnalyticalCongestionAware
+diff --git a/include/astra-network-analytical/congestion_unaware/Graph.h b/include/astra-network-analytical/congestion_unaware/Graph.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7ce85a6100c02e884596d41b16b8c74c52adfbc
+--- /dev/null
++++ b/include/astra-network-analytical/congestion_unaware/Graph.h
+@@ -0,0 +1,23 @@
++/******************************************************************************
++This source code is licensed under the MIT license found in the
++LICENSE file in the root directory of this source tree.
++*******************************************************************************/
++
++#pragma once
++
++#include "common/GraphData.h"
++#include "congestion_unaware/Topology.h"
++
++namespace NetworkAnalyticalCongestionUnaware {
++
++class Graph final : public Topology {
++  public:
++    explicit Graph(const NetworkParser& parser);
++    [[nodiscard]] EventTime send(DeviceId src, DeviceId dest, ChunkSize chunk_size) const noexcept override;
++    [[nodiscard]] const GraphData& get_graph_data() const noexcept;
++
++  private:
++    GraphData graph;
++};
++
++}  // namespace NetworkAnalyticalCongestionUnaware
+diff --git a/input/GraphDiamond4.edges.csv b/input/GraphDiamond4.edges.csv
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c7f6ad064ae1a5757d54627e4d83779c37e18f1
+--- /dev/null
++++ b/input/GraphDiamond4.edges.csv
+@@ -0,0 +1,9 @@
++src,dst,bandwidth_GBps,latency_ns
++0,1,200,0
++1,0,200,0
++0,2,100,0
++2,0,100,0
++1,3,100,0
++3,1,100,0
++2,3,100,0
++3,2,100,0
+diff --git a/input/GraphDiamond4.map b/input/GraphDiamond4.map
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6e2f5c6c613d073bddb43d719dc64869408a219
+--- /dev/null
++++ b/input/GraphDiamond4.map
+@@ -0,0 +1,4 @@
++0 1 1 0
++1 0 0 1
++1 0 0 1
++0 1 1 0
+diff --git a/input/GraphDiamond4.paths b/input/GraphDiamond4.paths
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff443801173f2359831e34e5d851b3fdb682ac17
+--- /dev/null
++++ b/input/GraphDiamond4.paths
+@@ -0,0 +1,17 @@
++source-major routes
++[0]
++[0, 1]
++[0, 2]
++[0, 1, 3]
++[1, 0]
++[1]
++[1, 0, 2]
++[1, 3]
++[2, 0]
++[2, 0, 1]
++[2]
++[2, 3]
++[3, 1, 0]
++[3, 1]
++[3, 2]
++[3]
+diff --git a/input/GraphDiamond4.yml b/input/GraphDiamond4.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..c529b1670c50d7dcbe10d8acfb3285e76bc8e834
+--- /dev/null
++++ b/input/GraphDiamond4.yml
+@@ -0,0 +1,9 @@
++topology: [ Graph ]
++npus_count: [ 4 ]
++bandwidth: [ 100 ]
++latency: [ 0 ]
++graph:
++  adjacency-matrix: GraphDiamond4.map
++  routing-paths: GraphDiamond4.paths
++  edge-properties: GraphDiamond4.edges.csv
++  injection-latency: 0
+diff --git a/input/GraphLine3.edges.csv b/input/GraphLine3.edges.csv
+new file mode 100644
+index 0000000000000000000000000000000000000000..63d800f2261fbc9c3b42b11350b4d00fa5b1a5d9
+--- /dev/null
++++ b/input/GraphLine3.edges.csv
+@@ -0,0 +1,5 @@
++src,dst,bandwidth_GBps,latency_ns
++0,1,100,10
++1,0,100,10
++1,2,50,20
++2,1,50,20
+diff --git a/input/GraphLine3.map b/input/GraphLine3.map
+new file mode 100644
+index 0000000000000000000000000000000000000000..d30e792cd4e7ff93e1f2dacb8061d2c225133001
+--- /dev/null
++++ b/input/GraphLine3.map
+@@ -0,0 +1,3 @@
++0 1 0
++1 0 1
++0 1 0
+diff --git a/input/GraphLine3.paths b/input/GraphLine3.paths
+new file mode 100644
+index 0000000000000000000000000000000000000000..540f56c0aca73fda0c964298546ebabda07b826c
+--- /dev/null
++++ b/input/GraphLine3.paths
+@@ -0,0 +1,10 @@
++source-major routes
++[0]
++[0, 1]
++[0, 1, 2]
++[1, 0]
++[1]
++[1, 2]
++[2, 1, 0]
++[2, 1]
++[2]
+diff --git a/input/GraphLine3.yml b/input/GraphLine3.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3d220d10f99e27ae8c97ed11621d5aa6d99d55d
+--- /dev/null
++++ b/input/GraphLine3.yml
+@@ -0,0 +1,9 @@
++topology: [ Graph ]
++npus_count: [ 3 ]
++bandwidth: [ 100 ]
++latency: [ 0 ]
++graph:
++  adjacency-matrix: GraphLine3.map
++  routing-paths: GraphLine3.paths
++  edge-properties: GraphLine3.edges.csv
++  injection-latency: 5
+diff --git a/input/GraphMalformed.paths b/input/GraphMalformed.paths
+new file mode 100644
+index 0000000000000000000000000000000000000000..e55a2aa0bb0a931c666aae8d810e1ba612b69e7a
+--- /dev/null
++++ b/input/GraphMalformed.paths
+@@ -0,0 +1,10 @@
++source-major routes
++[0]
++[0, 1]
++[0, 2]
++[1, 0]
++[1]
++[1, 2]
++[2, 1, 0]
++[2, 1]
++[2]
+diff --git a/input/GraphMalformed.yml b/input/GraphMalformed.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..b61a3403de37e65edb903885eceae251bae430ec
+--- /dev/null
++++ b/input/GraphMalformed.yml
+@@ -0,0 +1,8 @@
++topology: [ Graph ]
++npus_count: [ 3 ]
++bandwidth: [ 100 ]
++latency: [ 0 ]
++graph:
++  adjacency-matrix: GraphLine3.map
++  routing-paths: GraphMalformed.paths
++  injection-latency: 5
+diff --git a/test/test_congestion_aware.cpp b/test/test_congestion_aware.cpp
+index dd0f122c52cc705381bf62d1b50114067b1c1a56..86f69450f5d5acd9d0ef991870cd57c80ced387a 100644
+--- a/test/test_congestion_aware.cpp
++++ b/test/test_congestion_aware.cpp
+@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
+ #include "common/Type.h"
+ #include "congestion_aware/Chunk.h"
+ #include "congestion_aware/Helper.h"
++#include <algorithm>
+ #include <gtest/gtest.h>
+ 
+ using namespace NetworkAnalytical;
+@@ -50,7 +51,7 @@ TEST_F(TestNetworkAnalyticalCongestionAware, Ring) {
+ 
+     /// test
+     const auto simulation_time = event_queue->get_current_time();
+-    EXPECT_EQ(simulation_time, 60'093);
++    EXPECT_EQ(simulation_time, 64'413);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionAware, FullyConnected) {
+@@ -72,7 +73,7 @@ TEST_F(TestNetworkAnalyticalCongestionAware, FullyConnected) {
+ 
+     /// test
+     const auto simulation_time = event_queue->get_current_time();
+-    EXPECT_EQ(simulation_time, 20'031);
++    EXPECT_EQ(simulation_time, 21'471);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionAware, Switch) {
+@@ -94,7 +95,7 @@ TEST_F(TestNetworkAnalyticalCongestionAware, Switch) {
+ 
+     /// test
+     const auto simulation_time = event_queue->get_current_time();
+-    EXPECT_EQ(simulation_time, 40'062);
++    EXPECT_EQ(simulation_time, 42'942);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionAware, AllGatherOnRing) {
+@@ -130,5 +131,54 @@ TEST_F(TestNetworkAnalyticalCongestionAware, AllGatherOnRing) {
+ 
+     /// test
+     const auto simulation_time = event_queue->get_current_time();
+-    EXPECT_EQ(simulation_time, 704'116);
++    EXPECT_EQ(simulation_time, 755'956);
++}
++
++TEST_F(TestNetworkAnalyticalCongestionAware, GraphMultiHopTiming) {
++    const auto network_parser = NetworkParser("../../input/GraphLine3.yml");
++    const auto topology = construct_topology(network_parser);
++    auto chunk = std::make_unique<Chunk>(1'000, topology->route(0, 2), callback, nullptr);
++    topology->send(std::move(chunk));
++    while (!event_queue->finished()) {
++        event_queue->proceed();
++    }
++    // injection 5 + (10 latency + 10 serialization) + (20 + 20)
++    EXPECT_EQ(event_queue->get_current_time(), 65);
++}
++
++TEST_F(TestNetworkAnalyticalCongestionAware, GraphDisjointTransfersDoNotQueue) {
++    const auto network_parser = NetworkParser("../../input/GraphDiamond4.yml");
++    const auto topology = construct_topology(network_parser);
++    topology->send(std::make_unique<Chunk>(1'000, topology->route(0, 1), callback, nullptr));
++    topology->send(std::make_unique<Chunk>(1'000, topology->route(2, 3), callback, nullptr));
++    while (!event_queue->finished()) {
++        event_queue->proceed();
++    }
++    EXPECT_EQ(event_queue->get_current_time(), 10);
++    for (const auto& link : topology->get_link_statistics()) {
++        EXPECT_EQ(link.queued_chunks, 0);
++    }
++}
++
++TEST_F(TestNetworkAnalyticalCongestionAware, GraphSharedLinkFifoAndCounters) {
++    const auto network_parser = NetworkParser("../../input/GraphDiamond4.yml");
++    const auto topology = construct_topology(network_parser);
++    topology->send(std::make_unique<Chunk>(1'000, topology->route(0, 3), callback, nullptr));
++    topology->send(std::make_unique<Chunk>(1'000, topology->route(1, 3), callback, nullptr));
++    while (!event_queue->finished()) {
++        event_queue->proceed();
++    }
++    EXPECT_EQ(event_queue->get_current_time(), 20);
++    const auto links = topology->get_link_statistics();
++    const auto shared = std::find_if(links.begin(), links.end(), [](const auto& link) {
++        return link.src == 1 && link.dest == 3;
++    });
++    ASSERT_NE(shared, links.end());
++    EXPECT_EQ(shared->transmitted_bytes, 2'000);
++    EXPECT_EQ(shared->transmitted_chunks, 2);
++    EXPECT_EQ(shared->serialization_busy_time, 20);
++    EXPECT_EQ(shared->queued_chunks, 1);
++    EXPECT_EQ(shared->total_queue_wait, 5);
++    EXPECT_EQ(shared->max_queue_wait, 5);
++    EXPECT_EQ(shared->max_queue_depth, 1);
+ }
+diff --git a/test/test_congestion_unaware.cpp b/test/test_congestion_unaware.cpp
+index e9cb82f8d4729fed6e8dd067e44a1b0eb0286032..9dcfc4c0c11889cd47fdd79ec14c498a071c3561 100644
+--- a/test/test_congestion_unaware.cpp
++++ b/test/test_congestion_unaware.cpp
+@@ -28,7 +28,7 @@ TEST_F(TestNetworkAnalyticalCongestionUnaware, Ring) {
+ 
+     // run communication
+     const auto comm_delay = topology->send(1, 4, chunk_size);
+-    EXPECT_EQ(comm_delay, 21'031);
++    EXPECT_EQ(comm_delay, 22'471);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionUnaware, FullyConnected) {
+@@ -38,7 +38,7 @@ TEST_F(TestNetworkAnalyticalCongestionUnaware, FullyConnected) {
+ 
+     // run communication
+     const auto comm_delay = topology->send(1, 4, chunk_size);
+-    EXPECT_EQ(comm_delay, 20'031);
++    EXPECT_EQ(comm_delay, 21'471);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionUnaware, Switch) {
+@@ -48,7 +48,7 @@ TEST_F(TestNetworkAnalyticalCongestionUnaware, Switch) {
+ 
+     // run communication
+     const auto comm_delay = topology->send(1, 4, chunk_size);
+-    EXPECT_EQ(comm_delay, 20'531);
++    EXPECT_EQ(comm_delay, 21'971);
+ }
+ 
+ TEST_F(TestNetworkAnalyticalCongestionUnaware, Ring_FullyConnected_Switch) {
+@@ -58,13 +58,32 @@ TEST_F(TestNetworkAnalyticalCongestionUnaware, Ring_FullyConnected_Switch) {
+ 
+     // run on dim 1
+     const auto comm_delay_dim1 = topology->send(0, 1, chunk_size);
+-    EXPECT_EQ(comm_delay_dim1, 4'932);
++    EXPECT_EQ(comm_delay_dim1, 5'292);
+ 
+     // run on dim 2
+     const auto comm_delay_dim2 = topology->send(37, 41, chunk_size);
+-    EXPECT_EQ(comm_delay_dim2, 10'265);
++    EXPECT_EQ(comm_delay_dim2, 10'985);
+ 
+     // run on dim 3
+     const auto comm_delay_dim3 = topology->send(26, 42, chunk_size);
+-    EXPECT_EQ(comm_delay_dim3, 23'531);
++    EXPECT_EQ(comm_delay_dim3, 24'971);
++}
++
++TEST_F(TestNetworkAnalyticalCongestionUnaware, GraphRelativePathsAndHeterogeneousLinks) {
++    const auto network_parser = NetworkParser("../../input/GraphLine3.yml");
++    const auto topology = construct_topology(network_parser);
++
++    // injection 5 + edge latency 10+20 + 1000 bytes / 50 B/ns
++    EXPECT_EQ(topology->send(0, 2, 1'000), 55);
++    EXPECT_EQ(topology->get_dims_count(), 1);
++    EXPECT_EQ(topology->get_npus_count(), 3);
++}
++
++TEST_F(TestNetworkAnalyticalCongestionUnaware, GraphRejectsNonPhysicalRoute) {
++    EXPECT_EXIT(
++        {
++            const auto parser = NetworkParser("../../input/GraphMalformed.yml");
++            (void)construct_topology(parser);
++        },
++        ::testing::ExitedWithCode(255), "missing directed edge");
+ }
