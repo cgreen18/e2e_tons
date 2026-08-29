@@ -9,6 +9,8 @@ The experiment design is in
 [`docs/end_to_end_simulation_plan.md`](docs/end_to_end_simulation_plan.md), and
 the topology bundle formats are documented in
 [`docs/topology_and_routing_artifacts.md`](docs/topology_and_routing_artifacts.md).
+For a new lead agent, use the ready-to-paste
+[`docs/ORCHESTRATOR_START_PROMPT.md`](docs/ORCHESTRATOR_START_PROMPT.md).
 
 ## Directory structure
 

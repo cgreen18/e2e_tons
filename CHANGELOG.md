@@ -26,3 +26,9 @@ Brief implementation notes are appended here by each collaborating agent.
   documents; recorded that pMCF/PDTT results remain unfinished and untrusted.
 - **root:** Added a committed canonical 128-router topology fixture and
   third-party patch escrow so the root status can be reconstructed online.
+
+## 2026-08-29
+
+- **root:** Added a ready-to-paste orchestrator prompt with handoff paths,
+  milestone publication discipline, Codex CLI agent setup, and trace-provenance
+  guidance.
