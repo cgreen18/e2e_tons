@@ -1,0 +1,69 @@
+{
+  "description": "Certified pMCF (path-based maximum-concurrent-flow) all-to-all solves for the three canonical 128-router bundles, with the physical all-to-all cut bound each optimum is measured against.",
+  "generated": "2026-08-31",
+  "subchunks": 8,
+  "seed": 1,
+  "candidate_policy": "cpl-safe destination-based",
+  "topologies": {
+    "pt": {
+      "bundle_stem": "pt_2c_128r_6p_4x4x8",
+      "solver": "gurobi",
+      "solver_version": "13.0.2",
+      "certification": "exact-monolithic-lp",
+      "candidate_paths": 462749,
+      "positive_paths": 16499,
+      "maximum_concurrent_flow": 0.007804878048780488,
+      "quantized_maximum_link_load": 1026,
+      "epochs": 1044,
+      "selected_route_throughput_bound": 0.0078125,
+      "all_to_all_cut_bound": 0.0078125,
+      "cut_bound_description": "dim2 slab width 4: 32 directed links leave a side of 64 routers",
+      "fraction_of_cut_bound": 0.9990243902439024
+    },
+    "pdtt": {
+      "bundle_stem": "pdtt_2c_128r_6p_4x4x8",
+      "solver": "gurobi",
+      "solver_version": "13.0.2",
+      "certification": "exact-monolithic-lp",
+      "candidate_paths": 171960,
+      "positive_paths": 16896,
+      "maximum_concurrent_flow": 0.013609782030834662,
+      "quantized_maximum_link_load": 591,
+      "epochs": 645,
+      "selected_route_throughput_bound": 0.013513513513513514,
+      "all_to_all_cut_bound": 0.015625,
+      "cut_bound_description": "dim0 slab width 2: 64 directed links leave a side of 64 routers",
+      "fraction_of_cut_bound": 0.8710260499734184
+    },
+    "tons": {
+      "bundle_stem": "asc_lp_sym_2c_128r_6p_4x4x8_4x4x4",
+      "solver": "gurobi",
+      "solver_version": "13.0.2",
+      "certification": "exact-monolithic-lp",
+      "candidate_paths": 152917,
+      "positive_paths": 16896,
+      "maximum_concurrent_flow": 0.013998250218722662,
+      "quantized_maximum_link_load": 574,
+      "epochs": 627,
+      "selected_route_throughput_bound": 0.013888888888888888,
+      "all_to_all_cut_bound": 0.015625,
+      "cut_bound_description": "dim0 slab width 2: 64 directed links leave a side of 64 routers",
+      "fraction_of_cut_bound": 0.8958880139982504
+    }
+  },
+  "pmcf_alltoall_ratio_versus_pt": {
+    "pt": 1.0,
+    "pdtt": 1.7437533227006912,
+    "tons": 1.793525809273841
+  },
+  "route_load_reference_versus_pt": {
+    "pdtt": 1.7297297297297298,
+    "tons": 1.7777777777777777
+  },
+  "notes": [
+    "PT all-to-all is bisection-limited: its cut bound 1/128 is reached by the selected DOR routing, so pMCF cannot improve on PT and lands at 8/1025, 99.94% of the physical ceiling.",
+    "3544 of PT's 16256 selected DOR routes are absent from the CPL-safe candidate set, which is why the PT pMCF optimum is a hair below 1/128 rather than exactly equal to it.",
+    "PDTT and TONS have twice PT's all-to-all cut bound (1/64), which is the source of their A2A advantage; both pMCF optima exceed their own selected-route bounds, so the measured ratios slightly exceed the route-load references 128/74 and 128/72.",
+    "These are solver results only. They are not simulated throughput; see the sweep results for measured ASTRA-sim behaviour."
+  ]
+}

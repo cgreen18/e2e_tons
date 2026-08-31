@@ -63,3 +63,25 @@ Brief implementation notes are appended here by each collaborating agent.
   blocking rather than a recorded pass, required certified pre-solved pMCF
   artifacts instead of solving inside prepare, and added synthetic 111-job,
   queue-policy, and three-panel plot tests.
+- **root:** Certified all three canonical pMCF solves with unrestricted Gurobi
+  13.0.2 on compute nodes, all `exact-monolithic-lp`, all schedules verified at
+  128 ranks with sends equal to receives: PT 7.804878049e-03 over 462,749
+  candidates (149 s), PDTT 1.360978203e-02 over 171,960 (328 s), TONS
+  1.399825022e-02 over 152,917 (259 s). pMCF A2A ratios versus PT are PDTT
+  1.7438 and TONS 1.7935, slightly above the 128/74 = 1.7297 and 128/72 =
+  1.7778 route-load references because pMCF also beats each bundle's own
+  selected-route bound. Derived the all-to-all cut bounds that explain the
+  numbers: PT is bisection-limited at exactly 1/128 (32 directed links cross
+  between halves of 64), so pMCF reaches 99.90% of PT's physical ceiling and
+  cannot improve on DOR, while PDTT and TONS have twice that cut (1/64). Also
+  found that 3,544 of PT's 16,256 selected DOR routes are absent from its
+  CPL-safe candidate set, which is why PT's optimum sits just below 1/128.
+  Retained the evidence in `experiments/tons_128/results/pmcf_certification.json`.
+- **root:** Ran the ASTRA analytical C++ fixtures: 6 congestion-unaware and 7
+  congestion-aware tests pass, including the TONS Graph multi-hop timing,
+  disjoint-transfer, shared-link FIFO/counter, heterogeneous-link, and
+  non-physical-route cases. They must be run from a directory where their
+  hardcoded `../../input/` fixture path resolves, and they need the spack GCC 12
+  toolchain; the system GCC 8 fails to link `std::filesystem`. Note the Rust
+  `l3ss_tree` workspace builds but contains no tests at all (16 targets, 0
+  tests), so "Rust workspace tests passed" is not evidence of anything.
