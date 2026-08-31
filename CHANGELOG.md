@@ -59,3 +59,7 @@ Brief implementation notes are appended here by each collaborating agent.
 - **PDTT topology review:** Verified the committed PDTT metrics, artifact
   alignment, CDG safety, and link roles; activated fixture-backed regressions
   and rejected CPL candidates without a consistent allowed VC assignment.
+- **harness review:** Hardened harness acceptance so a reversed A2A trend is
+  blocking rather than a recorded pass, required certified pre-solved pMCF
+  artifacts instead of solving inside prepare, and added synthetic 111-job,
+  queue-policy, and three-panel plot tests.
