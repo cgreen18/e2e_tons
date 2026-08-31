@@ -85,3 +85,25 @@ Brief implementation notes are appended here by each collaborating agent.
   toolchain; the system GCC 8 fails to link `std::filesystem`. Note the Rust
   `l3ss_tree` workspace builds but contains no tests at all (16 targets, 0
   tests), so "Rust workspace tests passed" is not evidence of anything.
+- **root:** Completed and accepted the full three-topology sweep. Fixed the
+  batch-stage script: `module` is a login-shell function, so `#!/bin/bash` plus
+  `module load protobuf/3.18.0 || true` silently no-opped and the first ASTRA
+  job died with exit 127 on a missing `libprotobuf.so.3.18.0.0`; the script now
+  uses a login shell, does not swallow the module failure, and refuses to start
+  if either analytical binary has an unresolved shared library. prepare expanded
+  to exactly 111 jobs (10 min 9 s), run completed all 111 with every rank
+  complete (18 min 35 s), analyze passed with zero failures across 48 checks.
+  Congestion-aware A2A at 256 MiB gives TONS/PT 1.7546 direct, 1.7946
+  fixed-route-pipeline, 1.6674 pMCF, and PDTT/PT 1.7047, 1.7669, 1.6180. pMCF
+  raises absolute throughput on every topology (+11.4% PT, +2.0% PDTT, +3.5%
+  TONS versus fixed-route-pipeline) but compresses the ratio because PT gains
+  most; the measured ratios track store-and-forward epoch depth to within 0.5%,
+  not the LP objective. AG/AR/RS stay within 0.04% of PT. Promoted the
+  normalized summaries, ten plots, and an acceptance report to
+  `experiments/tons_128/results/`, retaining the earlier PT/TONS baseline
+  unmodified under `results/baseline_pt_tons/`.
+- **root:** Trace ingestion remains OUTSTANDING and is not part of this
+  milestone. The public host `http://storage2.spcl.ethz.ch/traces/astra-sim-traces/`
+  was confirmed reachable (HTTP 200) but nothing was downloaded, no
+  `trace_sources.json` provenance manifest exists yet, and no trace fixture or
+  composition code has been written.
