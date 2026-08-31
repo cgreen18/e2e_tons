@@ -32,3 +32,16 @@ Brief implementation notes are appended here by each collaborating agent.
 - **root:** Added a ready-to-paste orchestrator prompt with handoff paths,
   milestone publication discipline, Codex CLI agent setup, and trace-provenance
   guidance.
+
+## 2026-08-31
+
+- **root:** Fixed the pMCF column-generation reduced-cost sign. SciPy/HiGHS
+  returns marginals as d(objective)/d(rhs), so capacity duals are non-positive
+  and commodity duals non-negative; pricing on the unnegated sum selected the
+  *longest* inactive paths and declared convergence while improving columns
+  remained. Added the mandatory `diamond6` K(2,4) multi-path fixture and a
+  direct finite-LP cross-check: the old code certified 0.2 where the true
+  optimum is 4/11 = 0.363636. Added an independent primal feasibility/concurrency
+  certification and recorded solver version, active-path count, iterations,
+  seed, and certification status in the pMCF report. `venv_py12/bin/python -m
+  unittest discover -s tests -v` passes 19 tests (was 16).

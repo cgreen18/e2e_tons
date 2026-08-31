@@ -168,10 +168,16 @@ def prepare(manifest_file: Path | str) -> Path:
         bundles[topology_name]["pmcf"] = {
             "candidate_policy": manifest.get("pmcf", {}).get("candidate_policy", "cpl-safe"),
             "candidate_paths": pmcf.candidate_paths,
+            "active_paths": pmcf.active_paths,
             "positive_paths": pmcf.positive_paths,
             "maximum_concurrent_flow": pmcf.maximum_concurrent_flow,
             "quantized_maximum_link_load": pmcf.quantized_maximum_link_load,
             "epochs": pmcf.epochs,
+            "solver": pmcf.solver,
+            "solver_version": pmcf.solver_version,
+            "iterations": pmcf.iterations,
+            "certification": pmcf.certification,
+            "seed": pmcf.seed,
             "report": str(pmcf.report),
         }
         for mode, xml in (

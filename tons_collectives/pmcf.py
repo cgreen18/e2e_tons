@@ -17,14 +17,69 @@ class PmcfResult:
     report: Path
     ranks: int
     candidate_paths: int
+    active_paths: int
     positive_paths: int
     maximum_concurrent_flow: float
     quantized_maximum_link_load: int
     epochs: int
     solver: str
+    solver_version: str
+    iterations: int
+    certification: str
     topology: str
     candidates: str
     subchunks: int
+    seed: int
+
+
+@dataclass(frozen=True)
+class PmcfSolution:
+    """A solved pMCF instance plus the evidence needed to certify it."""
+
+    values: dict[int, float]
+    maximum_concurrent_flow: float
+    active_paths: int
+    iterations: int
+    solver_version: str
+    certification: str
+
+
+def _certify(
+    candidates: list[list[int]],
+    by_commodity: dict[tuple[int, int], list[int]],
+    values: dict[int, float],
+    concurrent_value: float,
+    *,
+    tolerance: float = 1e-7,
+) -> None:
+    """Fail loudly unless the returned flow is feasible and concurrent.
+
+    Column generation only certifies optimality over the finite candidate set;
+    this independently re-checks the two primal properties a caller relies on,
+    so a solver or bookkeeping regression cannot be published as a result.
+    """
+
+    load: dict[tuple[int, int], float] = defaultdict(float)
+    for index, value in values.items():
+        if value <= 0.0:
+            continue
+        route = candidates[index]
+        for edge in zip(route, route[1:]):
+            load[edge] += value
+    if load:
+        worst_edge, worst_load = max(load.items(), key=lambda item: item[1])
+        if worst_load > 1.0 + tolerance:
+            raise RuntimeError(
+                f"pMCF solution violates unit capacity on {worst_edge[0]}->{worst_edge[1]}: "
+                f"{worst_load:.12g}"
+            )
+    for commodity, indices in sorted(by_commodity.items()):
+        carried = sum(max(0.0, values[index]) for index in indices)
+        if abs(carried - concurrent_value) > tolerance:
+            raise RuntimeError(
+                f"pMCF commodity {commodity[0]}->{commodity[1]} carries {carried:.12g}, "
+                f"expected the concurrent value {concurrent_value:.12g}"
+            )
 
 
 def _read_map(path: Path) -> list[list[int]]:
@@ -130,11 +185,16 @@ def generate_pmcf_alltoall(
             "subchunks": subchunks,
             "solver": solver,
         }
-        if all(cached.get(key) == value for key, value in expected.items()):
+        fields = set(PmcfResult.__dataclass_fields__)
+        # A report written before the certification fields existed cannot be
+        # trusted as a certified solve, so re-solve instead of adapting it.
+        if fields <= set(cached) and all(
+            cached.get(key) == value for key, value in expected.items()
+        ):
             return PmcfResult(
                 **{
-                    key: (Path(value) if key in {"schedule", "report"} else value)
-                    for key, value in cached.items()
+                    key: (Path(cached[key]) if key in {"schedule", "report"} else cached[key])
+                    for key in fields
                 }
             )
     topology = _read_map(topology_path)
@@ -142,15 +202,16 @@ def generate_pmcf_alltoall(
     candidates, by_commodity, by_edge = _read_candidates(candidates_path, topology)
 
     if solver == "highs":
-        values, concurrent_value = _solve_highs(
-            candidates, by_commodity, by_edge, ranks
-        )
+        solution = _solve_highs(candidates, by_commodity, by_edge, ranks)
     elif solver == "gurobi":
-        values, concurrent_value = _solve_gurobi(
+        solution = _solve_gurobi(
             candidates, by_commodity, by_edge, threads=threads, seed=seed
         )
     else:
         raise ValueError("pMCF solver must be 'highs' or 'gurobi'")
+    values = solution.values
+    concurrent_value = solution.maximum_concurrent_flow
+    _certify(candidates, by_commodity, values, concurrent_value)
     assignments = _quantize(candidates, by_commodity, values, subchunks)
     quantized_load: Counter[tuple[int, int]] = Counter()
     for _, _, _, route in assignments:
@@ -164,14 +225,19 @@ def generate_pmcf_alltoall(
         report=report_path.resolve(),
         ranks=ranks,
         candidate_paths=len(candidates),
+        active_paths=solution.active_paths,
         positive_paths=sum(value > 1e-12 for value in values.values()),
         maximum_concurrent_flow=concurrent_value,
         quantized_maximum_link_load=max(quantized_load.values()),
         epochs=max((transfer.epoch for transfer in transfers), default=-1) + 1,
         solver=solver,
+        solver_version=solution.solver_version,
+        iterations=solution.iterations,
+        certification=solution.certification,
         topology=str(topology_path.resolve()),
         candidates=str(candidates_path.resolve()),
         subchunks=subchunks,
+        seed=seed,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -188,11 +254,12 @@ def _solve_gurobi(
     *,
     threads: int,
     seed: int,
-) -> tuple[dict[int, float], float]:
+) -> PmcfSolution:
     try:
         import gurobipy as gp
     except ImportError as exc:
         raise RuntimeError("Gurobi pMCF synthesis requires gurobipy") from exc
+    version = ".".join(str(part) for part in gp.gurobi.version())
     model = gp.Model("tons_pmcf")
     model.Params.OutputFlag = 0
     model.Params.Threads = max(1, threads)
@@ -207,9 +274,15 @@ def _solve_gurobi(
     model.optimize()
     if model.Status != gp.GRB.OPTIMAL:
         raise RuntimeError(f"pMCF did not reach optimal status (status={model.Status})")
-    return (
-        {index: float(flows[index].X) for index in range(len(candidates))},
-        float(concurrent.X),
+    return PmcfSolution(
+        values={index: float(flows[index].X) for index in range(len(candidates))},
+        maximum_concurrent_flow=float(concurrent.X),
+        active_paths=len(candidates),
+        iterations=1,
+        solver_version=version,
+        # Gurobi builds every finite candidate column at once, so an OPTIMAL
+        # status is already an exact optimum over the candidate set.
+        certification="exact-monolithic-lp",
     )
 
 
@@ -218,13 +291,15 @@ def _solve_highs(
     by_commodity: dict[tuple[int, int], list[int]],
     by_edge: dict[tuple[int, int], list[int]],
     ranks: int,
-) -> tuple[dict[int, float], float]:
+) -> PmcfSolution:
     try:
         import numpy as np
+        import scipy
         from scipy.optimize import linprog
         from scipy.sparse import coo_matrix
     except ImportError as exc:
         raise RuntimeError("HiGHS pMCF synthesis requires scipy and numpy") from exc
+    version = f"scipy-{scipy.__version__}-highs-ds"
 
     path_count = len(candidates)
     edge_rows = {edge: row for row, edge in enumerate(sorted(by_edge))}
@@ -284,16 +359,30 @@ def _solve_highs(
         if not result.success:
             raise RuntimeError(f"HiGHS pMCF restricted master failed: {result.message}")
 
-        edge_duals = result.ineqlin.marginals
-        commodity_duals = result.eqlin.marginals
+        # SciPy/HiGHS marginals are d(objective)/d(rhs) for the minimization
+        # form, so capacity duals are non-positive and commodity duals are
+        # non-negative.  The reduced cost of an inactive path column p of
+        # commodity k is therefore
+        #     rc(p) = 0 - (y_eq[k] + sum_{e in p} y_ub[e])
+        #           = length(p) - price(k)
+        # with the non-negative edge length length(e) = -y_ub[e] and the
+        # non-negative commodity price price(k) = y_eq[k].  Pricing in a path
+        # shorter than its commodity's price is what improves the master; using
+        # the unnegated sum prices in the *longest* paths and terminates while
+        # genuinely improving columns remain (see the diamond regression test).
+        edge_length = {edge: -float(result.ineqlin.marginals[row]) for edge, row in edge_rows.items()}
+        commodity_price = {
+            commodity: float(result.eqlin.marginals[row])
+            for commodity, row in commodity_rows.items()
+        }
         improving: dict[tuple[int, int], list[tuple[float, int]]] = defaultdict(list)
         for path_index, route in enumerate(candidates):
             if path_index in active:
                 continue
             commodity = (route[0], route[-1])
-            reduced_cost = float(commodity_duals[commodity_rows[commodity]]) + sum(
-                float(edge_duals[edge_rows[edge]]) for edge in zip(route, route[1:])
-            )
+            reduced_cost = sum(
+                edge_length[edge] for edge in zip(route, route[1:])
+            ) - commodity_price[commodity]
             if reduced_cost < -1e-8:
                 improving[commodity].append((reduced_cost, path_index))
         print(
@@ -306,7 +395,17 @@ def _solve_highs(
             values = {index: 0.0 for index in range(path_count)}
             for column, path_index in enumerate(active_list):
                 values[path_index] = float(result.x[column])
-            return values, float(result.x[concurrent_index])
+            return PmcfSolution(
+                values=values,
+                maximum_concurrent_flow=float(result.x[concurrent_index]),
+                active_paths=len(active_list),
+                iterations=iteration,
+                solver_version=version,
+                # The loop only exits after pricing *every* finite candidate
+                # path and finding no negative reduced cost, which is the
+                # Dantzig-Wolfe optimality certificate for this candidate set.
+                certification="exact-column-generation-no-improving-column",
+            )
         # Eight paths match the experiment's quantization granularity while
         # substantially reducing the number of restricted-master rounds.  The
         # final no-negative-column scan still certifies the exact LP optimum.
