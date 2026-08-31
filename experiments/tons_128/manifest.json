@@ -12,8 +12,9 @@
   "ranks": 128,
   "subchunks": 8,
   "pmcf": {
-    "solver": "highs",
+    "solver": "gurobi",
     "candidate_policy": "cpl-safe",
+    "threads": 32,
     "seed": 1
   },
   "sizes_bytes": [1048576, 16777216, 268435456],

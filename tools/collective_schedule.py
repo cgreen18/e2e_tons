@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -38,6 +39,12 @@ def main(argv: list[str] | None = None) -> int:
     pmcf.add_argument("--solver", choices=("highs", "gurobi"), default="highs")
     pmcf.add_argument("--seed", type=int, default=1)
     pmcf.add_argument("--output", type=Path, required=True)
+    pmcf.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="pMCF JSON report path; defaults to the schedule with a .pmcf.json suffix",
+    )
     verify = subparsers.add_parser("verify")
     verify.add_argument("schedule", type=Path)
     args = parser.parse_args(argv)
@@ -53,10 +60,12 @@ def main(argv: list[str] | None = None) -> int:
             args.candidates,
             args.subchunks,
             args.output,
+            report_path=args.report,
             solver=args.solver,
             threads=args.threads,
             seed=args.seed,
         )
+        print(json.dumps(asdict(result), indent=2, sort_keys=True, default=str))
         report = verify_schedule(result.schedule)
     else:
         report = verify_schedule(args.schedule)

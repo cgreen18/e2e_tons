@@ -261,9 +261,17 @@ def _solve_gurobi(
         raise RuntimeError("Gurobi pMCF synthesis requires gurobipy") from exc
     version = ".".join(str(part) for part in gp.gurobi.version())
     model = gp.Model("tons_pmcf")
-    model.Params.OutputFlag = 0
+    # These solves take minutes at 128 routers, so let the simplex log reach the
+    # batch job's stdout rather than running silently.
+    model.Params.OutputFlag = 1
     model.Params.Threads = max(1, threads)
     model.Params.Seed = seed
+    # A degenerate maximum-concurrent-flow LP has many optimal vertices and the
+    # quantizer consumes the specific path fractions, so pin the deterministic
+    # dual simplex instead of the default concurrent method: barrier/simplex
+    # racing would return a different optimal basis from run to run and make the
+    # compiled schedule irreproducible.
+    model.Params.Method = 1
     flows = model.addVars(len(candidates), lb=0.0, name="flow")
     concurrent = model.addVar(lb=0.0, name="concurrent_flow")
     for indices in by_edge.values():

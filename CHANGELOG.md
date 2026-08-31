@@ -45,3 +45,14 @@ Brief implementation notes are appended here by each collaborating agent.
   certification and recorded solver version, active-path count, iterations,
   seed, and certification status in the pMCF report. `venv_py12/bin/python -m
   unittest discover -s tests -v` passes 19 tests (was 16).
+- **root:** Added `tools/slurm/pmcf_solve.sbatch` so the 128-router pMCF LPs run
+  on compute nodes (`-A mithuna -p cpu`) instead of a login node, switched the
+  manifest to the unrestricted Gurobi backend, pinned Gurobi to deterministic
+  dual simplex so the quantizer sees a reproducible optimal basis, and added a
+  `--report` flag to `tools/collective_schedule.py pmcf-a2a`. Note the token
+  license is *not* picked up automatically on compute nodes: without
+  `GRB_LICENSE_FILE` gurobipy falls back to its size-limited pip license, so
+  the batch script sets it explicitly. Removed the invalid PT pMCF artifacts
+  from the aborted run (objective 1/212 with exactly one positive path per
+  commodity, i.e. the unimproved seed routing). Solves are in flight; no pMCF
+  result is accepted yet.
