@@ -14,7 +14,7 @@ from tons_topology.graph_config import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-ARTIFACT_ROOT = REPOSITORY / "topologies_and_routing"
+ARTIFACT_ROOT = REPOSITORY / "topology_fixtures" / "tons_128"
 
 
 class EdgeClassificationTest(unittest.TestCase):
@@ -34,7 +34,6 @@ class EdgeClassificationTest(unittest.TestCase):
         self.assertEqual(25.0, PAPER_1_GHZ_PROFILE.injection_latency_ns)
 
 
-@unittest.skipUnless((ARTIFACT_ROOT / "topo_maps").is_dir(), "artifact symlink unavailable")
 class FullGraphConfigTest(unittest.TestCase):
     def test_target_topologies_have_expected_link_classes(self) -> None:
         for bundle in ("pt-dor-128", "pdtt-128", "tons-128"):
@@ -55,6 +54,59 @@ class FullGraphConfigTest(unittest.TestCase):
                 self.assertEqual(768, len(rows))
                 self.assertIn("topology: [ Graph ]", artifacts.network_config.read_text())
                 self.assertIn("injection-latency: 25.0", artifacts.network_config.read_text())
+
+    def test_pdtt_electrical_links_are_exactly_the_fixed_cube_mesh(self) -> None:
+        from tons_topology import known_bundle
+
+        dimensions = TopologyDimensions()
+        paths = known_bundle(ARTIFACT_ROOT, "pdtt-128")
+        rows = [
+            [int(float(token)) for token in line.split()]
+            for line in paths.topology.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        pdtt_edges = {
+            (source, destination)
+            for source, row in enumerate(rows)
+            for destination, connected in enumerate(row)
+            if connected
+        }
+
+        fixed_mesh_edges = set()
+        for source in range(dimensions.routers):
+            source_coordinates = (
+                source % dimensions.x,
+                (source // dimensions.x) % dimensions.y,
+                source // (dimensions.x * dimensions.y),
+            )
+            for axis in range(3):
+                for step in (-1, 1):
+                    destination_coordinates = list(source_coordinates)
+                    destination_coordinates[axis] += step
+                    limits = (dimensions.x, dimensions.y, dimensions.z)
+                    if not 0 <= destination_coordinates[axis] < limits[axis]:
+                        continue
+                    if (
+                        destination_coordinates[axis] // dimensions.cube
+                        != source_coordinates[axis] // dimensions.cube
+                    ):
+                        continue
+                    x, y, z = destination_coordinates
+                    destination = x + dimensions.x * y + dimensions.x * dimensions.y * z
+                    fixed_mesh_edges.add((source, destination))
+
+        self.assertEqual(576, len(fixed_mesh_edges))
+        self.assertEqual(set(), fixed_mesh_edges - pdtt_edges)
+        self.assertEqual(192, len(pdtt_edges - fixed_mesh_edges))
+        self.assertTrue(
+            all(classify_directed_edge(*edge) == "electrical" for edge in fixed_mesh_edges)
+        )
+        self.assertTrue(
+            all(
+                classify_directed_edge(*edge) == "optical"
+                for edge in pdtt_edges - fixed_mesh_edges
+            )
+        )
 
 
 if __name__ == "__main__":
