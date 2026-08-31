@@ -5,7 +5,7 @@ cross-validated bundle. A topology map alone is not enough to reproduce a
 result: the selected routes, destination next hops, and VC allocation must have
 the same stem and ordering.
 
-## The two 128-router designs
+## The three 128-router designs
 
 Routers use the TPU-style coordinate mapping
 `router = x + 4*y + 16*z` over a `4x4x8` global grid. The final filename
@@ -13,11 +13,16 @@ component `4x4x4` on the TONS design is the canonical (minimum) symmetry cube;
 there are two such cubes along z. Each router has six bidirectional ports, so a
 map contains 768 directed edges. Of these, 576 are fixed, non-wrapping,
 one-coordinate intra-cube mesh edges (electrical). The remaining 192 directed
-edges are reconfigurable inter-cube links (optical).
+edges occupy reconfigurable face/wrapping roles (optical).
 
 - `pt_2c_128r_6p_4x4x8` is the two-cube Parallel Torus baseline. The selected
   bundle uses dimension-order routing with deterministic tie breaking and a
   destination-based next-hop function.
+- `pdtt_2c_128r_6p_4x4x8` is the two-cube PDTT baseline. It retains every
+  fixed, non-wrapping intra-cube mesh edge and uses twisted/wrapping links for
+  its remaining ports. Consequently the coordinate rule identifies the same
+  576 electrical and 192 optical directed-edge roles from the PDTT map; this
+  is a hardware-role classification, not a PT- or TONS-specific filename rule.
 - `asc_lp_sym_2c_128r_6p_4x4x8_4x4x4` is the symmetric, link-partitioned TONS
   topology optimized for approximate sparsest cut (`asc`). `sym` records that
   a canonical cube is expanded by symmetry; `2c`, `128r`, and `6p` mean two
@@ -77,6 +82,15 @@ PT DOR:
 - route/next hop/VC stem:
   `pt_2c_128r_6p_4x4x8_dor_dim_tiebreak_destbased`
 
+PDTT:
+
+- map: `topo_maps/pdtt_2c_128r_6p_4x4x8.map`
+- allowed turns: map stem plus `_turns_allowed_cpl_safe.allowvcturns`
+- candidates: map stem plus
+  `_turns_allowed_cpl_safe_destbased.rallpaths`
+- route/next-hop stem: candidate stem plus `_new_mclb_destbased`
+- VC: route stem plus `_olb.vcmat2`
+
 TONS:
 
 - map: `topo_maps/asc_lp_sym_2c_128r_6p_4x4x8_4x4x4.map`
@@ -87,23 +101,28 @@ TONS:
 - VC: route stem plus `_olb.vcmat2`
 
 Validation measures 16,256 non-self ordered flows. PT DOR has 65,536 selected
-hops (4.031496 average) and maximum directed-channel load 128. TONS has 54,864
-hops (3.375 average), maximum load 72, 152,917 candidates, and two VCs. Thus
-the fixed-route all-to-all load reference is `128/72 = 1.7778`.
+hops (4.031496 average) and maximum directed-channel load 128. PDTT has 56,430
+hops (3.471334 average), maximum load 74, 171,960 candidates, and two VCs.
+TONS has 54,864 hops (3.375 average), maximum load 72, 152,917 candidates, and
+two VCs. Thus the fixed-route all-to-all load references are `128/74 = 1.7297`
+for PDTT and `128/72 = 1.7778` for TONS.
 
 Run:
 
 ```bash
-venv_py12/bin/python tools/validate_topology_bundle.py --bundle pt-dor-128 --root topologies_and_routing
-venv_py12/bin/python tools/validate_topology_bundle.py --bundle tons-128 --root topologies_and_routing
-venv_py12/bin/python tools/generate_graph_config.py --bundle pt-dor-128 --root topologies_and_routing --output-dir generated/networks/pt
-venv_py12/bin/python tools/generate_graph_config.py --bundle tons-128 --root topologies_and_routing --output-dir generated/networks/tons
+venv_py12/bin/python tools/validate_topology_bundle.py --bundle pt-dor-128 --root topology_fixtures/tons_128
+venv_py12/bin/python tools/validate_topology_bundle.py --bundle pdtt-128 --root topology_fixtures/tons_128
+venv_py12/bin/python tools/validate_topology_bundle.py --bundle tons-128 --root topology_fixtures/tons_128
+venv_py12/bin/python tools/generate_graph_config.py --bundle pt-dor-128 --root topology_fixtures/tons_128 --output-dir generated/networks/pt
+venv_py12/bin/python tools/generate_graph_config.py --bundle pdtt-128 --root topology_fixtures/tons_128 --output-dir generated/networks/pdtt
+venv_py12/bin/python tools/generate_graph_config.py --bundle tons-128 --root topology_fixtures/tons_128 --output-dir generated/networks/tons
 ```
 
 The validator checks map connectivity/degree, source-major route positions,
-simple physical paths, destination next hops, candidate inclusion, route/VC
-alignment, allowed turns, and acyclicity of both the allowed and selected
-route-plus-VC channel dependency graphs.
+simple physical paths, destination next hops, candidate inclusion and an
+allowed end-to-end VC assignment for every candidate, route/VC alignment,
+allowed turns, and acyclicity of both the allowed and selected route-plus-VC
+channel dependency graphs.
 
 Analytical ASTRA consumes fixed application-level routes and per-edge timing.
 It does not simulate credits, finite packet buffers, VC arbitration, or

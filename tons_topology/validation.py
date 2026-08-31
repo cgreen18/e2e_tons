@@ -289,6 +289,28 @@ def _graph_is_acyclic(edges: Iterable[tuple[object, object]]) -> bool:
     return visited == len(nodes)
 
 
+def _path_has_allowed_vc_assignment(
+    path: tuple[int, ...],
+    turns: dict[Turn, bool],
+    vc_ids: set[int],
+) -> bool:
+    """Return whether one consistent VC sequence permits every turn in *path*."""
+
+    possible_vcs = set(vc_ids)
+    for first, middle, last in zip(path, path[1:], path[2:]):
+        possible_vcs = {
+            next_vc
+            for prior_vc in possible_vcs
+            for next_vc in vc_ids
+            if turns.get(
+                ((first, middle, prior_vc), (middle, last, next_vc)), False
+            )
+        }
+        if not possible_vcs:
+            return False
+    return True
+
+
 def _file_dict(paths: BundlePaths) -> dict[str, str]:
     return {
         key: str(value)
@@ -409,6 +431,7 @@ def validate_bundle(
         report.maximum_directed_channel_load = max(channel_load.values())
         report.unit_flow_throughput_bound = 1.0 / report.maximum_directed_channel_load
 
+    candidates: list[tuple[int, ...]] | None = None
     if paths.candidates is not None:
         candidates = _read_candidates(paths.candidates)
         report.candidate_paths = len(candidates)
@@ -499,6 +522,18 @@ def validate_bundle(
         allowed_edges = [turn for turn, allowed in turns.items() if allowed]
         if not _graph_is_acyclic(allowed_edges):
             report.errors.append("allowed channel-dependency graph contains a cycle")
+
+        if candidates is not None and vc_ids:
+            incompatible_candidate_count = sum(
+                1
+                for candidate in candidates
+                if not _path_has_allowed_vc_assignment(candidate, turns, vc_ids)
+            )
+            if incompatible_candidate_count:
+                report.errors.append(
+                    f"{incompatible_candidate_count} candidate routes have no allowed "
+                    "end-to-end VC assignment"
+                )
 
     if paths.vc_matrix is not None:
         vc_records = _read_tuple_records(paths.vc_matrix, 4)

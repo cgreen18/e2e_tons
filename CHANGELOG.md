@@ -56,3 +56,6 @@ Brief implementation notes are appended here by each collaborating agent.
   from the aborted run (objective 1/212 with exactly one positive path per
   commodity, i.e. the unimproved seed routing). Solves are in flight; no pMCF
   result is accepted yet.
+- **PDTT topology review:** Verified the committed PDTT metrics, artifact
+  alignment, CDG safety, and link roles; activated fixture-backed regressions
+  and rejected CPL candidates without a consistent allowed VC assignment.
