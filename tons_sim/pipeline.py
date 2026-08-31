@@ -14,7 +14,6 @@ from tons_collectives import (
     generate_collective_workload,
     generate_direct_alltoall,
     generate_fixed_route_alltoall,
-    generate_pmcf_alltoall,
     lower_msccl_to_chakra,
     verify_schedule,
 )
@@ -26,6 +25,30 @@ COLLECTIVE_KEY = {
     "allreduce": "all-reduce-implementation-custom",
     "reduce_scatter": "reduce-scatter-implementation-custom",
     "alltoall": "all-to-all-implementation-custom",
+}
+
+EXACT_PMCF_CERTIFICATIONS = {
+    "exact-column-generation-no-improving-column",
+    "exact-monolithic-lp",
+}
+PMCF_REPORT_FIELDS = {
+    "schedule",
+    "report",
+    "ranks",
+    "candidate_paths",
+    "active_paths",
+    "positive_paths",
+    "maximum_concurrent_flow",
+    "quantized_maximum_link_load",
+    "epochs",
+    "solver",
+    "solver_version",
+    "iterations",
+    "certification",
+    "topology",
+    "candidates",
+    "subchunks",
+    "seed",
 }
 
 
@@ -43,6 +66,92 @@ def _dump(path: Path, value: object) -> None:
 def _repo(manifest_path: Path, manifest: dict[str, Any]) -> Path:
     configured = manifest.get("repository_root", "../..")
     return (manifest_path.parent / configured).resolve()
+
+
+def _certified_pmcf_report(
+    topology_name: str,
+    report_path: Path,
+    schedule_path: Path,
+    topology_path: Path,
+    candidates_path: Path,
+    *,
+    ranks: int,
+    subchunks: int,
+    solver: str,
+    seed: int,
+) -> dict[str, Any]:
+    """Load an exact, matching pMCF result without ever starting a solve."""
+
+    if not report_path.is_file():
+        raise RuntimeError(
+            f"missing certified pMCF report for {topology_name}: {report_path}"
+        )
+    if not schedule_path.is_file():
+        raise RuntimeError(
+            f"missing certified pMCF schedule for {topology_name}: {schedule_path}"
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid pMCF report for {topology_name}: {report_path}"
+        ) from exc
+    if not isinstance(report, dict):
+        raise RuntimeError(f"invalid pMCF report for {topology_name}: expected an object")
+    missing = sorted(PMCF_REPORT_FIELDS - set(report))
+    if missing:
+        raise RuntimeError(
+            f"uncertified pMCF report for {topology_name}: missing {', '.join(missing)}"
+        )
+    certification = report["certification"]
+    if certification not in EXACT_PMCF_CERTIFICATIONS:
+        raise RuntimeError(
+            f"uncertified pMCF report for {topology_name}: certification={certification!r}"
+        )
+
+    expected_paths = {
+        "schedule": schedule_path,
+        "report": report_path,
+        "topology": topology_path,
+        "candidates": candidates_path,
+    }
+    for field, expected in expected_paths.items():
+        if Path(str(report[field])).resolve() != expected.resolve():
+            raise RuntimeError(
+                f"pMCF report mismatch for {topology_name}: {field}={report[field]!r}, "
+                f"expected {str(expected.resolve())!r}"
+            )
+    expected_values = {
+        "ranks": ranks,
+        "subchunks": subchunks,
+        "solver": solver,
+        "seed": seed,
+    }
+    for field, expected in expected_values.items():
+        if report[field] != expected:
+            raise RuntimeError(
+                f"pMCF report mismatch for {topology_name}: {field}={report[field]!r}, "
+                f"expected {expected!r}"
+            )
+    try:
+        counts_are_valid = (
+            int(report["candidate_paths"])
+            >= int(report["active_paths"])
+            >= int(report["positive_paths"])
+            > 0
+            and int(report["iterations"]) > 0
+            and float(report["maximum_concurrent_flow"]) > 0.0
+            and int(report["quantized_maximum_link_load"]) > 0
+            and int(report["epochs"]) > 0
+            and bool(report["solver_version"])
+        )
+    except (TypeError, ValueError):
+        counts_are_valid = False
+    if not counts_are_valid:
+        raise RuntimeError(
+            f"uncertified pMCF report for {topology_name}: invalid solve metadata"
+        )
+    return report
 
 
 def _make_system(path: Path, collective: str, schedule_prefix: Path) -> Path:
@@ -101,11 +210,37 @@ def prepare(manifest_file: Path | str) -> Path:
     topology_root = (repo / manifest["topology_root"]).resolve()
     ranks = int(manifest["ranks"])
     subchunks = int(manifest["subchunks"])
+    pmcf_solver = str(manifest.get("pmcf", {}).get("solver", "highs"))
+    pmcf_seed = int(manifest.get("pmcf", {}).get("seed", manifest["random_seed"]))
+
+    # The canonical solves are an explicit prerequisite for preparation.  Do
+    # this preflight before generating any other artifacts so a missing or
+    # stale report cannot silently trigger an expensive solve on the caller's
+    # machine or leave a partially prepared experiment behind.
+    topology_bundles: dict[str, Any] = {}
+    pmcf_reports: dict[str, dict[str, Any]] = {}
+    for topology_name, definition in manifest["topologies"].items():
+        bundle = known_bundle(topology_root, definition["bundle"])
+        topology_bundles[topology_name] = bundle
+        pmcf_candidates = bundle.pmcf_candidates or bundle.candidates
+        if pmcf_candidates is None:
+            raise RuntimeError(f"topology {topology_name} has no pMCF candidate paths")
+        pmcf_reports[topology_name] = _certified_pmcf_report(
+            topology_name,
+            reports_dir / f"{topology_name}.alltoall.pmcf.json",
+            schedules_dir / topology_name / "alltoall-pmcf.xml",
+            bundle.topology,
+            pmcf_candidates,
+            ranks=ranks,
+            subchunks=subchunks,
+            solver=pmcf_solver,
+            seed=pmcf_seed,
+        )
 
     bundles: dict[str, Any] = {}
     schedule_prefixes: dict[tuple[str, str, str], Path] = {}
     for topology_name, definition in manifest["topologies"].items():
-        bundle = known_bundle(topology_root, definition["bundle"])
+        bundle = topology_bundles[topology_name]
         report = validate_bundle(bundle, expected_degree=6, destination_based=True)
         _dump(reports_dir / f"{topology_name}.topology.json", report.to_dict())
         if not report.ok or report.routers != ranks:
@@ -151,39 +286,26 @@ def prepare(manifest_file: Path | str) -> Path:
             subchunks,
             schedules_dir / topology_name / "alltoall-fixed-route-pipeline.xml",
         )
-        pmcf_candidates = bundle.pmcf_candidates or bundle.candidates
-        if pmcf_candidates is None:
-            raise RuntimeError(f"topology {topology_name} has no pMCF candidate paths")
-        pmcf = generate_pmcf_alltoall(
-            bundle.topology,
-            pmcf_candidates,
-            subchunks,
-            schedules_dir / topology_name / "alltoall-pmcf.xml",
-            report_path=reports_dir / f"{topology_name}.alltoall.pmcf.json",
-            solver=str(manifest.get("pmcf", {}).get("solver", "highs")),
-            threads=int(manifest.get("pmcf", {}).get("threads", 16)),
-            seed=int(manifest.get("pmcf", {}).get("seed", manifest["random_seed"])),
-            reuse=True,
-        )
+        pmcf = pmcf_reports[topology_name]
         bundles[topology_name]["pmcf"] = {
             "candidate_policy": manifest.get("pmcf", {}).get("candidate_policy", "cpl-safe"),
-            "candidate_paths": pmcf.candidate_paths,
-            "active_paths": pmcf.active_paths,
-            "positive_paths": pmcf.positive_paths,
-            "maximum_concurrent_flow": pmcf.maximum_concurrent_flow,
-            "quantized_maximum_link_load": pmcf.quantized_maximum_link_load,
-            "epochs": pmcf.epochs,
-            "solver": pmcf.solver,
-            "solver_version": pmcf.solver_version,
-            "iterations": pmcf.iterations,
-            "certification": pmcf.certification,
-            "seed": pmcf.seed,
-            "report": str(pmcf.report),
+            "candidate_paths": pmcf["candidate_paths"],
+            "active_paths": pmcf["active_paths"],
+            "positive_paths": pmcf["positive_paths"],
+            "maximum_concurrent_flow": pmcf["maximum_concurrent_flow"],
+            "quantized_maximum_link_load": pmcf["quantized_maximum_link_load"],
+            "epochs": pmcf["epochs"],
+            "solver": pmcf["solver"],
+            "solver_version": pmcf["solver_version"],
+            "iterations": pmcf["iterations"],
+            "certification": pmcf["certification"],
+            "seed": pmcf["seed"],
+            "report": str(Path(pmcf["report"]).resolve()),
         }
         for mode, xml in (
             ("direct", direct_xml),
             ("fixed-route-pipeline", pipeline_xml),
-            ("pmcf", pmcf.schedule),
+            ("pmcf", Path(pmcf["schedule"])),
         ):
             verification = verify_schedule(xml)
             _dump(reports_dir / f"{topology_name}.alltoall.{mode}.schedule.json", verification.to_dict())
@@ -422,12 +544,17 @@ def _acceptance(
         for row in rows if row["stage"] == "primary"
     }
     for row in rows:
+        queue_accounting = (
+            int(row.get("queued_chunks", 0)),
+            int(row.get("total_queue_wait_ns", 0)),
+            int(row.get("max_queue_wait_ns", 0)),
+        )
         if (
             row["stage"] == "primary"
             and row["backend"] == "congestion_aware"
             and row["collective"] == "alltoall"
             and row["schedule_mode"] == "direct"
-            and row["queued_chunks"] == 0
+            and not all(value > 0 for value in queue_accounting)
         ):
             failures.append(f"{row['run_id']}: shared-link queue accounting is empty")
         if (
@@ -435,7 +562,7 @@ def _acceptance(
             and row["backend"] == "congestion_aware"
             and row["collective"] == "alltoall"
             and row["schedule_mode"] in {"fixed-route-pipeline", "pmcf"}
-            and row["queued_chunks"] != 0
+            and any(value != 0 for value in queue_accounting)
         ):
             failures.append(f"{row['run_id']}: scheduled A2A unexpectedly queued chunks")
     large_sizes = sorted({row["bytes_per_rank"] for row in rows})[-2:]
@@ -453,17 +580,23 @@ def _acceptance(
                             if pt.get("route_load_bound") and candidate.get("route_load_bound")
                             else None
                         )
+                        passed = speedup >= 1.0
                         checks.append({"check": "alltoall_comparison", "topology": topology,
                                        "backend": backend, "mode": mode,
                                        "bytes_per_rank": size, "speedup": speedup,
-                                       "route_load_reference": route_reference, "passed": True})
+                                       "route_load_reference": route_reference, "passed": passed})
+                        if not passed:
+                            failures.append(
+                                f"{topology} alltoall reversed versus PT: "
+                                f"{backend} {mode} {size} ({speedup:.6g}x)"
+                            )
                 for collective in ("allgather", "allreduce", "reduce_scatter"):
                     pt = indexed.get(("pt", backend, collective, "topology-aware", size))
                     candidate = indexed.get((topology, backend, collective, "topology-aware", size))
                     if pt and candidate:
                         ratio = candidate["throughput_GBps"] / pt["throughput_GBps"]
                         deviation = abs(ratio - 1.0)
-                        passed = deviation <= 0.05
+                        passed = deviation <= 0.05 + 1e-12
                         checks.append({"check": "collective_equality", "topology": topology,
                                        "backend": backend, "collective": collective,
                                        "bytes_per_rank": size, "ratio": ratio,

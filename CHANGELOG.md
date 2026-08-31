@@ -56,3 +56,5 @@ Brief implementation notes are appended here by each collaborating agent.
   from the aborted run (objective 1/212 with exactly one positive path per
   commodity, i.e. the unimproved seed routing). Solves are in flight; no pMCF
   result is accepted yet.
+- **root:** Hardened harness acceptance, required certified pre-solved pMCF
+  artifacts, and added synthetic 111-job, queue-policy, and three-panel plot tests.
