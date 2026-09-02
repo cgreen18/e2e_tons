@@ -113,4 +113,6 @@ Brief implementation notes are appended here by each collaborating agent.
 - **Chakra ET rewriter:** Added a streaming, deterministic trace rewriter with
   composable dangling-dependency repair and CPU NCCL launcher promotion,
   parallel rank processing, JSON provenance, synthetic coverage, and real
-  MoE8x13B/MoE8x70B rank-0 regressions for communication type/size recovery.
+  MoE8x13B/MoE8x70B rank-0 regressions for communication type/size recovery;
+  added on-demand binding generation from the authoritative submodule schema
+  so all protobuf tests execute under the root Python test command.

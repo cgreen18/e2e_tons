@@ -15,6 +15,7 @@ import argparse
 import ast
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+import importlib
 import json
 import os
 from pathlib import Path
@@ -48,16 +49,43 @@ class TraceFormatError(ValueError):
 
 
 def load_protobuf_module():
-    """Load regenerated Chakra bindings, never the repository's ancient copy."""
+    """Load explicit or bootstrapped bindings, never the ancient committed copy."""
 
     try:
         import et_def_pb2  # type: ignore[import-not-found]
-    except (ImportError, TypeError) as error:
+        return et_def_pb2
+    except Exception:
+        sys.modules.pop("et_def_pb2", None)
+
+    from tools.chakra_pb2_bootstrap import (
+        GENERATED_RELATIVE_DIR,
+        REPOSITORY_ROOT,
+        bootstrap_bindings,
+    )
+
+    generated_dir = REPOSITORY_ROOT / GENERATED_RELATIVE_DIR
+    generated_path = str(generated_dir)
+    if generated_path not in sys.path:
+        sys.path.insert(0, generated_path)
+    importlib.invalidate_caches()
+    try:
+        return importlib.import_module("et_def_pb2")
+    except Exception:
+        sys.modules.pop("et_def_pb2", None)
+
+    # An import failure means an existing generated file cannot be trusted,
+    # even if its schema stamp says it is current.
+    generated_dir = bootstrap_bindings(force=True)
+    generated_path = str(generated_dir)
+    if generated_path not in sys.path:
+        sys.path.insert(0, generated_path)
+    importlib.invalidate_caches()
+    try:
+        return importlib.import_module("et_def_pb2")
+    except Exception as error:
         raise RuntimeError(
-            "cannot import regenerated et_def_pb2; put its directory on "
-            "PYTHONPATH and run with the Chakra protobuf environment"
+            f"cannot import regenerated et_def_pb2 from {generated_dir}"
         ) from error
-    return et_def_pb2
 
 
 def _read_varint32(stream: BinaryIO) -> int | None:
@@ -477,6 +505,8 @@ def rewrite_collection(
 
     if jobs < 1:
         raise ValueError("jobs must be at least one")
+    # Bootstrap once in the parent before rank workers start concurrently.
+    load_protobuf_module()
     source = Path(source)
     output_dir = Path(output_dir)
     selected = tuple(name for name in PASS_ORDER if name in passes)

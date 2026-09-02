@@ -1,9 +1,15 @@
 from collections import Counter
 import json
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 
+from tools.chakra_pb2_bootstrap import (
+    ChakraVenvUnavailable,
+    bootstrap_bindings,
+    chakra_venv_fix_commands,
+)
 from tools.chakra_et_rewrite import (
     COMM_NAME_TO_ENUM_NAME,
     derive_comm_size,
@@ -17,14 +23,16 @@ from tools.chakra_et_rewrite import (
 
 
 try:
+    generated_bindings = bootstrap_bindings()
+    sys.path.insert(0, str(generated_bindings))
     import et_def_pb2 as chakra_pb
-except (ImportError, TypeError):
+except ChakraVenvUnavailable:
     chakra_pb = None
 
 
 PROTOBUF_SKIP_REASON = (
-    "requires regenerated et_def_pb2 on PYTHONPATH and the venv_chakra "
-    "protobuf runtime"
+    "venv_chakra is genuinely absent; fix with exactly: "
+    f"{chakra_venv_fix_commands()}"
 )
 REAL_MOE13_RANK0 = Path(
     "/home/green456/e2e_tons/ai_traces/"
@@ -131,6 +139,11 @@ class ChakraEtRewriteTest(unittest.TestCase):
         self.assertEqual(chakra_pb.COMP_NODE, malformed.type)
 
     def test_collection_manifest_parallelism_and_output_are_deterministic(self) -> None:
+        binding = generated_bindings / "et_def_pb2.py"
+        original_mtime = binding.stat().st_mtime_ns
+        self.assertEqual(generated_bindings, bootstrap_bindings())
+        self.assertEqual(original_mtime, binding.stat().st_mtime_ns)
+
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_dir = root / "input"
@@ -187,8 +200,9 @@ class ChakraEtRewriteTest(unittest.TestCase):
             self.assertEqual(COMM_NAME_TO_ENUM_NAME, loaded["name_to_enum"])
 
     def test_moe13_rank0_host_derivation_matches_4342_device_collectives(self) -> None:
-        if not REAL_MOE13_RANK0.is_file():
-            self.skipTest(f"real trace unavailable: {REAL_MOE13_RANK0}")
+        self.assertTrue(
+            REAL_MOE13_RANK0.is_file(), f"required real trace unavailable: {REAL_MOE13_RANK0}"
+        )
 
         host_collectives: Counter[tuple[int, int]] = Counter()
         device_collectives: Counter[tuple[int, int]] = Counter()
@@ -217,8 +231,9 @@ class ChakraEtRewriteTest(unittest.TestCase):
         self.assertEqual(106, sum(device_collectives.values()) - agreement)
 
     def test_moe70_rank0_promotes_every_mapped_name_and_only_coalesced_is_left(self) -> None:
-        if not REAL_MOE70_RANK0.is_file():
-            self.skipTest(f"real trace unavailable: {REAL_MOE70_RANK0}")
+        self.assertTrue(
+            REAL_MOE70_RANK0.is_file(), f"required real trace unavailable: {REAL_MOE70_RANK0}"
+        )
 
         promoted: Counter[str] = Counter()
         bytes_by_type: Counter[str] = Counter()
