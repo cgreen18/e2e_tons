@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "repository_root": "../..",
+  "output_directory": "generated/traces_128",
+  "trace_root": "generated/traces_128/repaired_traces",
+  "models": {
+    "llama7b": {
+      "directory": "Llama7B_N32_GPU128_PP1_DP128_7B_BS128",
+      "workload_prefix": "chakra"
+    },
+    "moe8x13b": {
+      "directory": "MoE8x13B_N32_GPU128_TP4_PP4_DP8_EP4_13B_BS128",
+      "workload_prefix": "chakra"
+    }
+  },
+  "topologies": {
+    "pt": {
+      "label": "PT",
+      "bundle": "pt-dor-128",
+      "network_configuration": "generated/tons_128/prepared/networks/pt/pt.yml"
+    },
+    "pdtt": {
+      "label": "PDTT",
+      "bundle": "pdtt-128",
+      "network_configuration": "generated/tons_128/prepared/networks/pdtt/pdtt.yml"
+    },
+    "tons": {
+      "label": "TONS",
+      "bundle": "tons-128",
+      "network_configuration": "generated/tons_128/prepared/networks/tons/tons.yml"
+    }
+  },
+  "backends": [
+    "congestion_unaware",
+    "congestion_aware"
+  ],
+  "binaries": {
+    "congestion_unaware": "simul/astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware",
+    "congestion_aware": "simul/astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware"
+  },
+  "remote_memory_configuration": "simul/astra-sim/examples/remote_memory/analytical/no_memory_expansion.json",
+  "comm_group_configuration": "empty",
+  "system_configuration_policy": {
+    "scheduling-policy": "FIFO",
+    "endpoint-delay": 10,
+    "active-chunks-per-dimension": 4,
+    "preferred-dataset-splits": 4,
+    "all-reduce-implementation": [
+      "ring"
+    ],
+    "all-gather-implementation": [
+      "ring"
+    ],
+    "reduce-scatter-implementation": [
+      "ring"
+    ],
+    "all-to-all-implementation": [
+      "ring"
+    ],
+    "collective-optimization": "baseline",
+    "local-mem-bw": 1600,
+    "boost-mode": 0,
+    "roofline-enabled": 0,
+    "peak-perf": 900
+  },
+  "ranks": 128,
+  "seed": 1
+}

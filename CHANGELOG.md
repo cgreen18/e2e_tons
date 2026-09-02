@@ -107,3 +107,11 @@ Brief implementation notes are appended here by each collaborating agent.
   was confirmed reachable (HTTP 200) but nothing was downloaded, no
   `trace_sources.json` provenance manifest exists yet, and no trace fixture or
   composition code has been written.
+
+## 2026-09-02
+
+- **trace experiment harness:** Added the manifest-driven 12-job real-Chakra
+  trace prepare/run/analyze path with strict 128-rank validation, native-ring
+  topology controls, normalized collective/communication/end-to-end speedups,
+  congestion plots, legacy-statistics handling, and ten focused regressions;
+  the full 39-test Python suite passes without skips.
