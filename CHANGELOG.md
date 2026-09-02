@@ -107,3 +107,14 @@ Brief implementation notes are appended here by each collaborating agent.
   was confirmed reachable (HTTP 200) but nothing was downloaded, no
   `trace_sources.json` provenance manifest exists yet, and no trace fixture or
   composition code has been written.
+
+## 2026-09-02
+
+- **ASTRA-sim statistics:** Added deterministic per-rank collective count,
+  byte, and busy-time breakdowns to structured JSON, including `UNKNOWN`
+  fallback accounting; proved the schema with a FeederV3 C++ regression and a
+  4-rank analytical AllReduce run while retaining all 6 congestion-unaware and
+  all 7 congestion-aware backend test passes. Added explicit `METADATA_NODE`
+  classification while excluding metadata from operator timing and wall-time
+  accounting, enabling real PyTorch-derived Chakra traces to pass statistics
+  collection without changing existing reported values.

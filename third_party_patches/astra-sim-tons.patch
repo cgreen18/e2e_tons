@@ -1,5 +1,5 @@
 diff --git a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc b/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
-index 8f3746ff50dd63d8055340e81f49e7ed5b74030c..77830fd4f7b7e9a920b7da017ff2c46f4e5a1259 100644
+index 8f3746f..77830fd 100644
 --- a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
 +++ b/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
 @@ -31,6 +31,8 @@ void CmdLineParser::define_options() noexcept {
@@ -13,10 +13,10 @@ index 8f3746ff50dd63d8055340e81f49e7ed5b74030c..77830fd4f7b7e9a920b7da017ff2c46f
          "compute-scale", "Compute scale",
 diff --git a/astra-sim/network_frontend/analytical/common/StructuredOutput.cc b/astra-sim/network_frontend/analytical/common/StructuredOutput.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..8cd45e78a382b973182a41678f6b4f008859fca4
+index 0000000..51ca1d3
 --- /dev/null
 +++ b/astra-sim/network_frontend/analytical/common/StructuredOutput.cc
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,98 @@
 +/******************************************************************************
 +This source code is licensed under the MIT license found in the
 +LICENSE file in the root directory of this source tree.
@@ -67,6 +67,7 @@ index 0000000000000000000000000000000000000000..8cd45e78a382b973182a41678f6b4f00
 +        const auto communication = stats->get_type_time(Type::COMM);
 +        const auto overlap = stats->get_comp_comm_overlap();
 +        const auto exposed = communication > overlap ? communication - overlap : 0;
++        const auto collectives = stats->get_collective_statistics();
 +        output << "    {\"rank\": " << rank
 +               << ", \"complete\": "
 +               << (workload->is_finished ? "true" : "false")
@@ -74,7 +75,17 @@ index 0000000000000000000000000000000000000000..8cd45e78a382b973182a41678f6b4f00
 +               << ", \"compute_time_ns\": " << compute
 +               << ", \"communication_time_ns\": " << communication
 +               << ", \"exposed_communication_time_ns\": " << exposed
-+               << ", \"overlap_time_ns\": " << overlap << "}"
++               << ", \"overlap_time_ns\": " << overlap
++               << ", \"collectives\": [";
++        for (size_t index = 0; index < collectives.size(); ++index) {
++            const auto& collective = collectives[index];
++            output << "{\"comm_type\": \"" << collective.comm_type
++                   << "\", \"count\": " << collective.count
++                   << ", \"bytes\": " << collective.bytes
++                   << ", \"time_ns\": " << collective.time_ns << "}"
++                   << (index + 1 == collectives.size() ? "" : ", ");
++        }
++        output << "]}"
 +               << (rank + 1 == systems.size() ? "\n" : ",\n");
 +    }
 +    output << "  ],\n  \"links\": [\n";
@@ -105,7 +116,7 @@ index 0000000000000000000000000000000000000000..8cd45e78a382b973182a41678f6b4f00
 +
 +}  // namespace AstraSimAnalytical
 diff --git a/astra-sim/network_frontend/analytical/congestion_aware/main.cc b/astra-sim/network_frontend/analytical/congestion_aware/main.cc
-index d81686b30344658179b5d9ca97173be1598e9311..734409dbdbf1d0689b9f2d8612b79b6bdffa3b8c 100644
+index d81686b..734409d 100644
 --- a/astra-sim/network_frontend/analytical/congestion_aware/main.cc
 +++ b/astra-sim/network_frontend/analytical/congestion_aware/main.cc
 @@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
@@ -137,7 +148,7 @@ index d81686b30344658179b5d9ca97173be1598e9311..734409dbdbf1d0689b9f2d8612b79b6b
          delete it;
      }
 diff --git a/astra-sim/network_frontend/analytical/congestion_unaware/main.cc b/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
-index 64c578c450b750b241b431b989f1245dcdc0ea33..38ed1bbce9ef1987f0f4771c31ae6b0217a7bd25 100644
+index 64c578c..38ed1bb 100644
 --- a/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
 +++ b/astra-sim/network_frontend/analytical/congestion_unaware/main.cc
 @@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
@@ -169,7 +180,7 @@ index 64c578c450b750b241b431b989f1245dcdc0ea33..38ed1bbce9ef1987f0f4771c31ae6b02
      }
 diff --git a/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh b/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh
 new file mode 100644
-index 0000000000000000000000000000000000000000..527f48f71fd2207a3629463be2f873cafb8ae49a
+index 0000000..527f48f
 --- /dev/null
 +++ b/astra-sim/network_frontend/analytical/include/common/StructuredOutput.hh
 @@ -0,0 +1,28 @@
@@ -202,7 +213,7 @@ index 0000000000000000000000000000000000000000..527f48f71fd2207a3629463be2f873ca
 +
 +}  // namespace AstraSimAnalytical
 diff --git a/astra-sim/system/Sys.cc b/astra-sim/system/Sys.cc
-index d2a279b483e6ae5d190bc6936090edda92e2aea6..19bbfc89a5027614c65184fdb239483ec5ac9b9e 100644
+index d2a279b..19bbfc8 100644
 --- a/astra-sim/system/Sys.cc
 +++ b/astra-sim/system/Sys.cc
 @@ -997,7 +997,10 @@ CollectivePhase Sys::generate_collective_phase(
@@ -218,7 +229,7 @@ index d2a279b483e6ae5d190bc6936090edda92e2aea6..19bbfc89a5027614c65184fdb239483e
      } else {
          LoggerFactory::get_logger("system")->critical(
 diff --git a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
-index e6351fb37460ff6d5f4f94bbedb7090bbc4d7636..1d9544d5a008e5c7b5a7ec342c6e9de2a408cd6a 100644
+index e6351fb..1d9544d 100644
 --- a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
 +++ b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
 @@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
@@ -361,7 +372,7 @@ index e6351fb37460ff6d5f4f94bbedb7090bbc4d7636..1d9544d5a008e5c7b5a7ec342c6e9de2
              &Sys::handleEvent, rcehd);
      } else if (type == ChakraNodeType::COMP_NODE) {
 diff --git a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
-index 2893b5dec3578e40a22ce52dbbd941bbc24e336b..76fe8a3fe7df432f4b5b85f7ccde0669f1acdc20 100644
+index 2893b5d..76fe8a3 100644
 --- a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
 +++ b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.hh
 @@ -17,6 +17,8 @@ LICENSE file in the root directory of this source tree.
@@ -409,11 +420,175 @@ index 2893b5dec3578e40a22ce52dbbd941bbc24e336b..76fe8a3fe7df432f4b5b85f7ccde0669
  };
  
  }  // namespace AstraSim
+diff --git a/astra-sim/workload/Statistics.cc b/astra-sim/workload/Statistics.cc
+index 628d51b..a649dcf 100644
+--- a/astra-sim/workload/Statistics.cc
++++ b/astra-sim/workload/Statistics.cc
+@@ -9,6 +9,43 @@
+ 
+ using namespace AstraSim;
+ 
++namespace {
++
++std::string get_collective_comm_type_name(
++    const std::shared_ptr<Chakra::ETFeederNode>& node) noexcept {
++    try {
++        const auto comm_type = node->get_attr<int64_t>("comm_type", -1);
++        switch (comm_type) {
++        case ChakraProtoMsg::ALL_REDUCE:
++            return "ALL_REDUCE";
++        case ChakraProtoMsg::REDUCE:
++            return "REDUCE";
++        case ChakraProtoMsg::ALL_GATHER:
++            return "ALL_GATHER";
++        case ChakraProtoMsg::GATHER:
++            return "GATHER";
++        case ChakraProtoMsg::SCATTER:
++            return "SCATTER";
++        case ChakraProtoMsg::BROADCAST:
++            return "BROADCAST";
++        case ChakraProtoMsg::ALL_TO_ALL:
++            return "ALL_TO_ALL";
++        case ChakraProtoMsg::REDUCE_SCATTER:
++            return "REDUCE_SCATTER";
++        case ChakraProtoMsg::REDUCE_SCATTER_BLOCK:
++            return "REDUCE_SCATTER_BLOCK";
++        case ChakraProtoMsg::BARRIER:
++            return "BARRIER";
++        default:
++            return "UNKNOWN";
++        }
++    } catch (...) {
++        return "UNKNOWN";
++    }
++}
++
++}  // namespace
++
+ Statistics::Statistics(Workload* workload) : workload(workload) {}
+ 
+ Statistics::OperatorStatistics& Statistics::get_operator_statistics(
+@@ -26,17 +63,50 @@ const std::unordered_map<NodeId, Statistics::OperatorStatistics>& Statistics::
+     return operator_statistics;
+ }
+ 
++std::vector<Statistics::CollectiveStatistics>
++Statistics::get_collective_statistics() const {
++    std::map<std::string, CollectiveStatistics> aggregate_by_type;
++    for (const auto& [node_id, stat] : operator_statistics) {
++        if (!stat.collective_comm_type.has_value()) {
++            continue;
++        }
++        const auto& comm_type = stat.collective_comm_type.value();
++        auto& aggregate = aggregate_by_type[comm_type];
++        aggregate.comm_type = comm_type;
++        ++aggregate.count;
++        aggregate.bytes += stat.comm_size.value_or(0);
++        aggregate.time_ns += stat.end_time - stat.start_time;
++    }
++
++    std::vector<CollectiveStatistics> result;
++    result.reserve(aggregate_by_type.size());
++    for (const auto& [comm_type, aggregate] : aggregate_by_type) {
++        result.push_back(aggregate);
++    }
++    return result;
++}
++
+ void Statistics::record_start(std::shared_ptr<Chakra::ETFeederNode> node,
+                               Tick start_time) {
+     const NodeId& node_id = node->id();
+     const auto type = OperatorStatistics::get_operator_type(node);
++    if (type == OperatorStatistics::OperatorType::METADATA) {
++        return;
++    }
+     operator_statistics[node_id] =
+         OperatorStatistics(node_id, start_time, type);
++    if (node->type() == ChakraNodeType::COMM_COLL_NODE) {
++        operator_statistics[node_id].collective_comm_type =
++            get_collective_comm_type_name(node);
++    }
+     start_times.insert({start_time, node_id});
+ }
+ 
+ void Statistics::record_end(std::shared_ptr<Chakra::ETFeederNode> node,
+                             Tick end_time) {
++    if (node->type() == ChakraNodeType::METADATA_NODE) {
++        return;
++    }
+     const NodeId& node_id = node->id();
+     this->get_operator_statistics(node_id).end_time = end_time;
+ }
+@@ -62,6 +132,10 @@ Statistics::OperatorStatistics::OperatorType Statistics::OperatorStatistics::
+     case ChakraNodeType::COMM_RECV_NODE:
+         stat_node_type = Statistics::OperatorStatistics::OperatorType::COMM;
+         break;
++    case ChakraNodeType::METADATA_NODE:
++        stat_node_type =
++            Statistics::OperatorStatistics::OperatorType::METADATA;
++        break;
+     case ChakraNodeType::INVALID_NODE:
+         stat_node_type = Statistics::OperatorStatistics::OperatorType::INVALID;
+         break;
+@@ -161,6 +235,8 @@ void Statistics::report(std::shared_ptr<spdlog::logger> logger) const {
+         case OperatorStatistics::OperatorType::REPLAY:
+             logger->info("sys[{}], Replay time: {}", sys_id, time);
+             break;
++        case OperatorStatistics::OperatorType::METADATA:
++            break;
+         case OperatorStatistics::OperatorType::INVALID:
+             logger->info("sys[{}], Invalid time: {}", sys_id, time);
+             break;
 diff --git a/astra-sim/workload/Statistics.hh b/astra-sim/workload/Statistics.hh
-index 169c46ccf31d2ff97c0f2a95e68da65fa0b3e6d5..682b31772162033227ae031ef882e5dac8c853da 100644
+index 169c46c..623a9f3 100644
 --- a/astra-sim/workload/Statistics.hh
 +++ b/astra-sim/workload/Statistics.hh
-@@ -90,6 +90,16 @@ class Statistics {
+@@ -6,7 +6,9 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "extern/graph_frontend/chakra/src/feeder_v3/et_feeder.h"
+ 
+@@ -19,10 +21,25 @@ class Workload;
+ class LocalMemoryTracker;
+ class Statistics {
+   public:
++    struct CollectiveStatistics {
++        std::string comm_type;
++        uint64_t count = 0;
++        uint64_t bytes = 0;
++        Tick time_ns = 0;
++    };
++
+     class OperatorStatistics {
+       public:
+         static const Tick INVALID_TICK = UINT64_MAX;
+-        enum class OperatorType { CPU, GPU, COMM, REMOTE_MEM, REPLAY, INVALID };
++        enum class OperatorType {
++            CPU,
++            GPU,
++            COMM,
++            REMOTE_MEM,
++            REPLAY,
++            METADATA,
++            INVALID
++        };
+         static OperatorType get_operator_type(
+             const std::shared_ptr<Chakra::ETFeederNode> node);
+         OperatorStatistics(NodeId node_id,
+@@ -57,6 +74,7 @@ class Statistics {
+ 
+         // communication node
+         std::optional<uint64_t> comm_size;  // Size of communication in bytes
++        std::optional<std::string> collective_comm_type;
+         std::optional<double>
+             network_bandwidth;  // Achieved bandwidth in bytes/ns
+ 
+@@ -90,6 +108,18 @@ class Statistics {
  
      void report() const;
  
@@ -426,7 +601,186 @@ index 169c46ccf31d2ff97c0f2a95e68da65fa0b3e6d5..682b31772162033227ae031ef882e5da
 +        const auto it = type_time.find(type);
 +        return it == type_time.end() ? 0 : it->second;
 +    }
++    [[nodiscard]] std::vector<CollectiveStatistics>
++    get_collective_statistics() const;
 +
    private:
      void extract_type_time();
      Tick _calculateTotalRuntimeFromIntervals(
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+new file mode 100644
+index 0000000..dd9defb
+--- /dev/null
++++ b/tests/CMakeLists.txt
+@@ -0,0 +1,27 @@
++cmake_minimum_required(VERSION 3.22)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++project(AstraSimTests)
++
++include(FetchContent)
++
++add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/.. AstraSim)
++
++FetchContent_Declare(
++    googletest
++    GIT_REPOSITORY https://github.com/google/googletest.git
++    GIT_TAG 1204d63
++)
++FetchContent_MakeAvailable(googletest)
++
++enable_testing()
++include(GoogleTest)
++
++add_executable(TestAstraSimStatistics StatisticsTest.cc)
++target_link_libraries(TestAstraSimStatistics PRIVATE AstraSim gtest_main)
++target_include_directories(
++    TestAstraSimStatistics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../extern/helper
++)
++gtest_discover_tests(TestAstraSimStatistics)
+diff --git a/tests/StatisticsTest.cc b/tests/StatisticsTest.cc
+new file mode 100644
+index 0000000..e815cb9
+--- /dev/null
++++ b/tests/StatisticsTest.cc
+@@ -0,0 +1,138 @@
++#include "astra-sim/workload/Statistics.hh"
++
++#include <chrono>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++namespace {
++
++void write_varint32(std::ostream& output, uint32_t value) {
++    while (value > 0x7f) {
++        output.put(static_cast<char>((value & 0x7f) | 0x80));
++        value >>= 7;
++    }
++    output.put(static_cast<char>(value));
++}
++
++template <typename Message>
++void write_message(std::ostream& output, const Message& message) {
++    const auto serialized = message.SerializeAsString();
++    write_varint32(output, static_cast<uint32_t>(serialized.size()));
++    output.write(serialized.data(), serialized.size());
++}
++
++void add_collective_type(ChakraProtoMsg::Node& node, int64_t comm_type) {
++    auto* const attribute = node.add_attr();
++    attribute->set_name("comm_type");
++    attribute->set_int64_val(comm_type);
++}
++
++class TemporaryTrace {
++  public:
++    TemporaryTrace() {
++        const auto timestamp = std::chrono::steady_clock::now()
++                                   .time_since_epoch()
++                                   .count();
++        path = std::filesystem::temp_directory_path() /
++            ("astra-statistics-test-" + std::to_string(timestamp) + ".et");
++
++        std::ofstream output(path, std::ios::binary);
++        ChakraProtoMsg::GlobalMetadata metadata;
++        metadata.set_version("0.0.4");
++        write_message(output, metadata);
++
++        add_node(output, 1, ChakraProtoMsg::COMM_COLL_NODE,
++                 ChakraProtoMsg::ALL_GATHER);
++        add_node(output, 2, ChakraProtoMsg::COMM_COLL_NODE,
++                 ChakraProtoMsg::ALL_REDUCE);
++        add_node(output, 3, ChakraProtoMsg::COMM_COLL_NODE,
++                 ChakraProtoMsg::ALL_GATHER);
++        add_node(output, 4, ChakraProtoMsg::COMM_COLL_NODE, 99);
++        add_node(output, 5, ChakraProtoMsg::COMM_COLL_NODE);
++        add_node(output, 6, ChakraProtoMsg::COMM_SEND_NODE);
++        add_node(output, 7, ChakraProtoMsg::METADATA_NODE);
++    }
++
++    ~TemporaryTrace() {
++        std::error_code error;
++        std::filesystem::remove(path, error);
++    }
++
++    std::filesystem::path path;
++
++  private:
++    static void add_node(
++        std::ostream& output,
++        uint64_t id,
++        ChakraProtoMsg::NodeType type,
++        const std::optional<int64_t>& comm_type = std::nullopt) {
++        ChakraProtoMsg::Node node;
++        node.set_id(id);
++        node.set_name("statistics_test_node_" + std::to_string(id));
++        node.set_type(type);
++        if (comm_type.has_value()) {
++            add_collective_type(node, comm_type.value());
++        }
++        write_message(output, node);
++    }
++};
++
++}  // namespace
++
++TEST(StatisticsTest, AggregatesCollectiveOperatorsByResolvedType) {
++    TemporaryTrace trace;
++    Chakra::ETFeeder feeder(trace.path.string());
++    AstraSim::Statistics statistics(nullptr);
++
++    const auto record = [&](uint64_t id,
++                            AstraSim::Tick start,
++                            AstraSim::Tick end,
++                            uint64_t bytes) {
++        const auto node = feeder.lookupNode(id);
++        statistics.record_start(node, start);
++        statistics.get_operator_statistics(id).comm_size = bytes;
++        statistics.record_end(node, end);
++    };
++
++    record(1, 10, 30, 100);
++    record(2, 40, 52, 64);
++    record(3, 60, 65, 150);
++    record(4, 70, 79, 3);
++    record(5, 80, 84, 7);
++    record(6, 90, 100, 1'000);
++
++    const auto metadata = feeder.lookupNode(7);
++    using OperatorType =
++        AstraSim::Statistics::OperatorStatistics::OperatorType;
++    EXPECT_EQ(
++        AstraSim::Statistics::OperatorStatistics::get_operator_type(metadata),
++        OperatorType::METADATA);
++    statistics.record_start(metadata, 1);
++    statistics.record_end(metadata, 1'000);
++    EXPECT_EQ(statistics.get_operator_statistics().count(metadata->id()), 0);
++    EXPECT_EQ(statistics.get_type_time(OperatorType::METADATA), 0);
++
++    const auto collectives = statistics.get_collective_statistics();
++    ASSERT_EQ(collectives.size(), 3);
++
++    EXPECT_EQ(collectives[0].comm_type, "ALL_GATHER");
++    EXPECT_EQ(collectives[0].count, 2);
++    EXPECT_EQ(collectives[0].bytes, 250);
++    EXPECT_EQ(collectives[0].time_ns, 25);
++
++    EXPECT_EQ(collectives[1].comm_type, "ALL_REDUCE");
++    EXPECT_EQ(collectives[1].count, 1);
++    EXPECT_EQ(collectives[1].bytes, 64);
++    EXPECT_EQ(collectives[1].time_ns, 12);
++
++    EXPECT_EQ(collectives[2].comm_type, "UNKNOWN");
++    EXPECT_EQ(collectives[2].count, 2);
++    EXPECT_EQ(collectives[2].bytes, 10);
++    EXPECT_EQ(collectives[2].time_ns, 13);
++}
