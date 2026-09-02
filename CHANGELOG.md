@@ -123,3 +123,9 @@ Brief implementation notes are appended here by each collaborating agent.
   topology controls, normalized collective/communication/end-to-end speedups,
   congestion plots, legacy-statistics handling, and ten focused regressions;
   the full 39-test Python suite passes without skips.
+- **Chakra ET rewriter:** Added a streaming, deterministic trace rewriter with
+  composable dangling-dependency repair and CPU NCCL launcher promotion,
+  parallel rank processing, JSON provenance, synthetic coverage, and real
+  MoE8x13B/MoE8x70B rank-0 regressions for communication type/size recovery;
+  added on-demand binding generation from the authoritative submodule schema
+  so all protobuf tests execute under the root Python test command.
