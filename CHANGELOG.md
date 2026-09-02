@@ -118,3 +118,8 @@ Brief implementation notes are appended here by each collaborating agent.
   classification while excluding metadata from operator timing and wall-time
   accounting, enabling real PyTorch-derived Chakra traces to pass statistics
   collection without changing existing reported values.
+- **trace experiment harness:** Added the manifest-driven 12-job real-Chakra
+  trace prepare/run/analyze path with strict 128-rank validation, native-ring
+  topology controls, normalized collective/communication/end-to-end speedups,
+  congestion plots, legacy-statistics handling, and ten focused regressions;
+  the full 39-test Python suite passes without skips.
