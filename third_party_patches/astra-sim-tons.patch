@@ -421,7 +421,7 @@ index 2893b5d..76fe8a3 100644
  
  }  // namespace AstraSim
 diff --git a/astra-sim/workload/Statistics.cc b/astra-sim/workload/Statistics.cc
-index 628d51b..064b8d9 100644
+index 628d51b..a649dcf 100644
 --- a/astra-sim/workload/Statistics.cc
 +++ b/astra-sim/workload/Statistics.cc
 @@ -9,6 +9,43 @@
@@ -468,7 +468,7 @@ index 628d51b..064b8d9 100644
  Statistics::Statistics(Workload* workload) : workload(workload) {}
  
  Statistics::OperatorStatistics& Statistics::get_operator_statistics(
-@@ -26,12 +63,39 @@ const std::unordered_map<NodeId, Statistics::OperatorStatistics>& Statistics::
+@@ -26,17 +63,50 @@ const std::unordered_map<NodeId, Statistics::OperatorStatistics>& Statistics::
      return operator_statistics;
  }
  
@@ -499,6 +499,9 @@ index 628d51b..064b8d9 100644
                                Tick start_time) {
      const NodeId& node_id = node->id();
      const auto type = OperatorStatistics::get_operator_type(node);
++    if (type == OperatorStatistics::OperatorType::METADATA) {
++        return;
++    }
      operator_statistics[node_id] =
          OperatorStatistics(node_id, start_time, type);
 +    if (node->type() == ChakraNodeType::COMM_COLL_NODE) {
@@ -508,8 +511,36 @@ index 628d51b..064b8d9 100644
      start_times.insert({start_time, node_id});
  }
  
+ void Statistics::record_end(std::shared_ptr<Chakra::ETFeederNode> node,
+                             Tick end_time) {
++    if (node->type() == ChakraNodeType::METADATA_NODE) {
++        return;
++    }
+     const NodeId& node_id = node->id();
+     this->get_operator_statistics(node_id).end_time = end_time;
+ }
+@@ -62,6 +132,10 @@ Statistics::OperatorStatistics::OperatorType Statistics::OperatorStatistics::
+     case ChakraNodeType::COMM_RECV_NODE:
+         stat_node_type = Statistics::OperatorStatistics::OperatorType::COMM;
+         break;
++    case ChakraNodeType::METADATA_NODE:
++        stat_node_type =
++            Statistics::OperatorStatistics::OperatorType::METADATA;
++        break;
+     case ChakraNodeType::INVALID_NODE:
+         stat_node_type = Statistics::OperatorStatistics::OperatorType::INVALID;
+         break;
+@@ -161,6 +235,8 @@ void Statistics::report(std::shared_ptr<spdlog::logger> logger) const {
+         case OperatorStatistics::OperatorType::REPLAY:
+             logger->info("sys[{}], Replay time: {}", sys_id, time);
+             break;
++        case OperatorStatistics::OperatorType::METADATA:
++            break;
+         case OperatorStatistics::OperatorType::INVALID:
+             logger->info("sys[{}], Invalid time: {}", sys_id, time);
+             break;
 diff --git a/astra-sim/workload/Statistics.hh b/astra-sim/workload/Statistics.hh
-index 169c46c..a326c3d 100644
+index 169c46c..623a9f3 100644
 --- a/astra-sim/workload/Statistics.hh
 +++ b/astra-sim/workload/Statistics.hh
 @@ -6,7 +6,9 @@
@@ -522,7 +553,7 @@ index 169c46c..a326c3d 100644
  
  #include "extern/graph_frontend/chakra/src/feeder_v3/et_feeder.h"
  
-@@ -19,6 +21,13 @@ class Workload;
+@@ -19,10 +21,25 @@ class Workload;
  class LocalMemoryTracker;
  class Statistics {
    public:
@@ -536,7 +567,20 @@ index 169c46c..a326c3d 100644
      class OperatorStatistics {
        public:
          static const Tick INVALID_TICK = UINT64_MAX;
-@@ -57,6 +66,7 @@ class Statistics {
+-        enum class OperatorType { CPU, GPU, COMM, REMOTE_MEM, REPLAY, INVALID };
++        enum class OperatorType {
++            CPU,
++            GPU,
++            COMM,
++            REMOTE_MEM,
++            REPLAY,
++            METADATA,
++            INVALID
++        };
+         static OperatorType get_operator_type(
+             const std::shared_ptr<Chakra::ETFeederNode> node);
+         OperatorStatistics(NodeId node_id,
+@@ -57,6 +74,7 @@ class Statistics {
  
          // communication node
          std::optional<uint64_t> comm_size;  // Size of communication in bytes
@@ -544,7 +588,7 @@ index 169c46c..a326c3d 100644
          std::optional<double>
              network_bandwidth;  // Achieved bandwidth in bytes/ns
  
-@@ -90,6 +100,18 @@ class Statistics {
+@@ -90,6 +108,18 @@ class Statistics {
  
      void report() const;
  
@@ -598,10 +642,10 @@ index 0000000..dd9defb
 +gtest_discover_tests(TestAstraSimStatistics)
 diff --git a/tests/StatisticsTest.cc b/tests/StatisticsTest.cc
 new file mode 100644
-index 0000000..f3b720d
+index 0000000..e815cb9
 --- /dev/null
 +++ b/tests/StatisticsTest.cc
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,138 @@
 +#include "astra-sim/workload/Statistics.hh"
 +
 +#include <chrono>
@@ -660,6 +704,7 @@ index 0000000..f3b720d
 +        add_node(output, 4, ChakraProtoMsg::COMM_COLL_NODE, 99);
 +        add_node(output, 5, ChakraProtoMsg::COMM_COLL_NODE);
 +        add_node(output, 6, ChakraProtoMsg::COMM_SEND_NODE);
++        add_node(output, 7, ChakraProtoMsg::METADATA_NODE);
 +    }
 +
 +    ~TemporaryTrace() {
@@ -709,6 +754,17 @@ index 0000000..f3b720d
 +    record(4, 70, 79, 3);
 +    record(5, 80, 84, 7);
 +    record(6, 90, 100, 1'000);
++
++    const auto metadata = feeder.lookupNode(7);
++    using OperatorType =
++        AstraSim::Statistics::OperatorStatistics::OperatorType;
++    EXPECT_EQ(
++        AstraSim::Statistics::OperatorStatistics::get_operator_type(metadata),
++        OperatorType::METADATA);
++    statistics.record_start(metadata, 1);
++    statistics.record_end(metadata, 1'000);
++    EXPECT_EQ(statistics.get_operator_statistics().count(metadata->id()), 0);
++    EXPECT_EQ(statistics.get_type_time(OperatorType::METADATA), 0);
 +
 +    const auto collectives = statistics.get_collective_statistics();
 +    ASSERT_EQ(collectives.size(), 3);
