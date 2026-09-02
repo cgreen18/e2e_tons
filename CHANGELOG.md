@@ -107,3 +107,10 @@ Brief implementation notes are appended here by each collaborating agent.
   was confirmed reachable (HTTP 200) but nothing was downloaded, no
   `trace_sources.json` provenance manifest exists yet, and no trace fixture or
   composition code has been written.
+
+## 2026-09-02
+
+- **Chakra ET rewriter:** Added a streaming, deterministic trace rewriter with
+  composable dangling-dependency repair and CPU NCCL launcher promotion,
+  parallel rank processing, JSON provenance, synthetic coverage, and real
+  MoE8x13B/MoE8x70B rank-0 regressions for communication type/size recovery.
