@@ -129,3 +129,14 @@ Brief implementation notes are appended here by each collaborating agent.
   MoE8x13B/MoE8x70B rank-0 regressions for communication type/size recovery;
   added on-demand binding generation from the authoritative submodule schema
   so all protobuf tests execute under the root Python test command.
+- **root:** Repaired both 128-rank trace sets with the committed rewriter and
+  verified the tool reproduces them byte-identically (sha256 match on rank 0),
+  rebuilt both analytical binaries with the new per-collective statistics
+  writer, and confirmed the main checkout's ASTRA-sim working tree regenerates
+  the committed escrow patch exactly. Added `--only <run_id>` to the trace
+  runner plus `tools/slurm/trace_run.sbatch`, so the 12-job matrix runs as a
+  SLURM array instead of serially: each job replays 37-89 million Chakra nodes
+  across 128 ranks and takes over an hour, which would have made a sequential
+  sweep take most of a day. Added `tools/slurm/astra_build.sbatch` and
+  `tools/slurm/chakra_rewrite.sbatch` so builds and whole-model trace rewrites
+  stay off the login node.

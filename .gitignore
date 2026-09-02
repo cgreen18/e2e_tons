@@ -6,7 +6,9 @@ generated/
 # The committed topology fixture contains only the canonical 128-router inputs.
 topologies_and_routing
 ai_traces
+ai_traces_repaired
 venv_py12/
+venv_chakra/
 .DS_Store
 
 

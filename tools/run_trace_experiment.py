@@ -19,11 +19,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--only",
+        help="run only the job with this run_id, so the matrix can be fanned out across SLURM tasks",
+    )
     args = parser.parse_args(argv)
     if args.stage == "prepare":
         result = prepare(args.manifest)
     elif args.stage == "run":
-        result = run(args.manifest, dry_run=args.dry_run, limit=args.limit)
+        result = run(
+            args.manifest, dry_run=args.dry_run, limit=args.limit, only=args.only
+        )
     else:
         result = analyze(args.manifest)
     print(result)

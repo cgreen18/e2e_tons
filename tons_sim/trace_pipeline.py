@@ -337,13 +337,28 @@ def run(
     *,
     dry_run: bool = False,
     limit: int | None = None,
+    only: str | None = None,
 ) -> Path:
-    """Execute jobs in order, recording provenance and blocking on any rank failure."""
+    """Execute jobs in order, recording provenance and blocking on any rank failure.
+
+    ``only`` restricts execution to the single job with that ``run_id``. Each
+    trace job replays roughly 37-89 million Chakra nodes across 128 ranks, so
+    running the matrix sequentially takes many hours; ``only`` lets one SLURM
+    task own one job and lets the whole matrix run concurrently. ``analyze``
+    reads the per-run records afterwards and does not care how they were
+    produced.
+    """
 
     _, prepared = _load(prepared_file)
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     jobs = prepared["jobs"][:limit] if limit is not None else prepared["jobs"]
+    if only is not None:
+        selected = [job for job in jobs if job["run_id"] == only]
+        if not selected:
+            available = ", ".join(sorted(job["run_id"] for job in jobs))
+            raise ValueError(f"no prepared job with run_id {only!r}; have: {available}")
+        jobs = selected
     _preflight_run(prepared, jobs, dry_run)
 
     repo = Path(prepared["repository_root"])

@@ -246,6 +246,22 @@ class TracePipelineTest(unittest.TestCase):
             self.assertEqual("", Path(record["stdout"]).read_text(encoding="utf-8"))
             self.assertEqual("", Path(record["stderr"]).read_text(encoding="utf-8"))
 
+    def test_only_selects_a_single_job_and_rejects_unknown_ids(self) -> None:
+        """--only lets one SLURM task own one job so the matrix can run concurrently."""
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared_path = prepare(_synthetic_manifest(root))
+            run_root = run(
+                prepared_path, dry_run=True, only="moe8x13b__tons__congestion_aware"
+            )
+            produced = sorted(path.parent.name for path in run_root.glob("*/run.json"))
+            self.assertEqual(["moe8x13b__tons__congestion_aware"], produced)
+            with self.assertRaises(ValueError) as caught:
+                run(prepared_path, dry_run=True, only="nope")
+            self.assertIn("no prepared job with run_id", str(caught.exception))
+            self.assertIn("moe8x13b__tons__congestion_aware", str(caught.exception))
+
     def test_missing_collectives_are_reported_unavailable(self) -> None:
         with TemporaryDirectory() as temporary:
             summary_path = analyze(

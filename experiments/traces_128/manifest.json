@@ -2,7 +2,7 @@
   "schema_version": 1,
   "repository_root": "../..",
   "output_directory": "generated/traces_128",
-  "trace_root": "generated/traces_128/repaired_traces",
+  "trace_root": "ai_traces_repaired",
   "models": {
     "llama7b": {
       "directory": "Llama7B_N32_GPU128_PP1_DP128_7B_BS128",
