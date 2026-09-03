@@ -161,3 +161,14 @@ Brief implementation notes are appended here by each collaborating agent.
   root-causing to a dedicated investigation track
   (codex/trace-deadlock-investigation) with the full evidence trail rather than
   guessing. No trace-driven performance claim is possible until this is fixed.
+- **trace deadlock investigation:** Confirmed the 12 real-trace failures are
+  malformed Chakra communication records, not topology/backend behavior or
+  inconsistent process-group metadata: the MoE stall is the first coalesced
+  AllGather (rank-0 node 261277, not 261297), whose missing `pg_name` selects a
+  128-rank ring instead of its 8-rank data-parallel group and whose byte count
+  combines input and output buffers; the Llama stall has the same coalesced
+  byte-accounting defect, with rank 127 recording a different payload from the
+  other 127 ranks. A full 256-trace audit also found missing native src/dst/tag
+  attributes on every MoE point-to-point record. Left ASTRA scheduling logic
+  unchanged and specified a preprocessing normalization plus cross-rank
+  agreement gate; do not rerun a real job until those trace repairs exist.
