@@ -143,6 +143,17 @@ Brief implementation notes are appended here by each collaborating agent.
 
 ## 2026-09-03
 
+- **root:** Hardened Chakra `promote-comm-ops` sizing by resolving each
+  launcher's communicator from the trace-local process-group metadata and a
+  bounded shared-control-scope `record_param_comms` correlation, falling back
+  explicitly to all model ranks when unresolved, recording per-rank/total hit
+  rates, and rounding the final size to the nearest `256 * group_size` bytes
+  with a one-unit floor. Added the parallel read-only collective profiler and
+  its 12-hour SLURM entry point; job 42794586 scanned every rank of all four
+  original AI-trace models in 1m43s and emitted 81 real profile rows, retaining
+  34,443 unresolved instances visibly rather than guessing. This is defensive
+  tooling work and is not claimed to fix the separate 12-job replay deadlock.
+
 - **root:** Ran the 12-job real-Chakra-trace matrix (2 models x 3 topologies x
   2 backends) as a SLURM array. ALL 12 FAILED with every rank reporting
   "unreleased nodes" at exit and statistics `complete: false` -- a genuine
