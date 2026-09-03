@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import ast
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 import importlib
 import json
 import os
@@ -23,7 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import BinaryIO, Iterable, Sequence
+from typing import BinaryIO, Callable, Iterable, Sequence
 
 
 PASS_ORDER = ("repair-deps", "promote-comm-ops")
@@ -42,10 +44,251 @@ COMM_NAME_TO_ENUM_NAME = {
 }
 TRACE_NAME_RE = re.compile(r"^chakra\.(\d+)\.et$")
 MANIFEST_NAME = "chakra_et_rewrite_manifest.json"
+PROCESS_GROUP_METADATA_NAME = "## process_group:init ##"
+RECORD_PARAM_COMMS_NAME = "record_param_comms"
+GROUP_SEARCH_WINDOW = 8
+_RECORD_PARAM_PG_RE = re.compile(
+    r"\[\s*['\"](?P<pg_id>\d+)['\"]\s*,\s*"
+    r"['\"](?P<kind>[A-Z][A-Z0-9_]*)['\"]\s*\]"
+)
 
 
 class TraceFormatError(ValueError):
     """Raised when a Chakra file is not a complete delimited protobuf stream."""
+
+
+@dataclass(frozen=True)
+class GroupSizeResolution:
+    """Communicator-group resolution for one collective node."""
+
+    group_size: int | None
+    source: str
+    pg_id: str | None
+    record_node_id: int | None
+    distance: int | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class _CollectiveControlContext:
+    node_id: int
+    control_scope: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _RecordParamContext:
+    node_id: int
+    control_scope: frozenset[int]
+    pg_id: str
+
+
+def parse_process_group_registry(values: str, model_rank_count: int) -> dict[str, int]:
+    """Parse ASTRA-sim's process-group metadata representation.
+
+    ``Workload::issue_pytorch_pg_metadata`` removes two characters from each
+    end of ``inputs.values`` before parsing the remaining JSON.  Empty rank
+    lists mean all model ranks.
+    """
+
+    if model_rank_count < 1:
+        raise ValueError("model rank count must be at least one")
+    if len(values) < 4:
+        raise ValueError("process-group metadata is too short for ASTRA trim")
+    try:
+        parsed = json.loads(values[2:-2])
+    except json.JSONDecodeError as error:
+        raise ValueError("process-group metadata is not valid trimmed JSON") from error
+    if not isinstance(parsed, list):
+        raise ValueError("process-group metadata must contain a JSON list")
+
+    registry: dict[str, int] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise ValueError("process-group metadata entries must be objects")
+        pg_id = item.get("pg_name")
+        ranks = item.get("ranks")
+        if not isinstance(pg_id, str) or not pg_id.isdigit():
+            raise ValueError("process-group pg_name must be a decimal string")
+        if not isinstance(ranks, list) or not all(
+            isinstance(rank, int) and not isinstance(rank, bool) for rank in ranks
+        ):
+            raise ValueError("process-group ranks must be an integer list")
+        if pg_id in registry:
+            raise ValueError(f"duplicate process-group id {pg_id}")
+        registry[pg_id] = len(ranks) if ranks else model_rank_count
+    return registry
+
+
+def parse_record_param_pg_id(values: str) -> str | None:
+    """Extract a process-group id from a record_param_comms input value."""
+
+    match = _RECORD_PARAM_PG_RE.search(values)
+    return match.group("pg_id") if match is not None else None
+
+
+class CollectiveGroupResolver:
+    """Correlate collective nodes with nearby process-group records.
+
+    Nodes must be observed in increasing id order.  A target and a
+    ``record_param_comms`` node match when they are within ``search_window``
+    ids and their direct/one-parent control scopes intersect.  The latter
+    handles the common layout where the collective depends on a c10d launcher
+    and the record node depends directly on their shared ProfilerStep.
+    """
+
+    def __init__(
+        self,
+        model_rank_count: int,
+        metadata_node_type: int,
+        *,
+        search_window: int = GROUP_SEARCH_WINDOW,
+    ) -> None:
+        if model_rank_count < 1:
+            raise ValueError("model rank count must be at least one")
+        if search_window < 1:
+            raise ValueError("group search window must be at least one")
+        self.model_rank_count = model_rank_count
+        self.metadata_node_type = metadata_node_type
+        self.search_window = search_window
+        self.registry: dict[str, int] | None = None
+        self._last_node_id: int | None = None
+        self._recent_ids: deque[int] = deque()
+        self._recent_ctrl_deps: dict[int, tuple[int, ...]] = {}
+        self._targets: list[_CollectiveControlContext] = []
+        self._records: list[_RecordParamContext] = []
+
+    def _control_scope(self, node) -> frozenset[int]:
+        scope = set(node.ctrl_deps)
+        for dependency in node.ctrl_deps:
+            scope.update(self._recent_ctrl_deps.get(dependency, ()))
+        return frozenset(scope)
+
+    def observe_node(self, node, *, target: bool = False) -> None:
+        """Observe one node and optionally register it for later resolution."""
+
+        node_id = int(node.id)
+        if self._last_node_id is not None and node_id <= self._last_node_id:
+            raise TraceFormatError("group-size resolution requires increasing node ids")
+        self._last_node_id = node_id
+        while self._recent_ids and self._recent_ids[0] < node_id - self.search_window:
+            expired = self._recent_ids.popleft()
+            self._recent_ctrl_deps.pop(expired, None)
+
+        scope = self._control_scope(node)
+        if node.type == self.metadata_node_type and node.name == PROCESS_GROUP_METADATA_NAME:
+            if self.registry is not None:
+                raise TraceFormatError("trace has multiple process-group metadata nodes")
+            try:
+                self.registry = parse_process_group_registry(
+                    node.inputs.values, self.model_rank_count
+                )
+            except ValueError as error:
+                raise TraceFormatError(f"invalid process-group metadata: {error}") from error
+
+        if node.name == RECORD_PARAM_COMMS_NAME:
+            pg_id = parse_record_param_pg_id(node.inputs.values)
+            if pg_id is not None:
+                self._records.append(_RecordParamContext(node_id, scope, pg_id))
+        if target:
+            self._targets.append(_CollectiveControlContext(node_id, scope))
+
+        self._recent_ids.append(node_id)
+        self._recent_ctrl_deps[node_id] = tuple(int(dep) for dep in node.ctrl_deps)
+
+    def resolve(self, *, fallback_to_all_ranks: bool) -> dict[int, GroupSizeResolution]:
+        """Resolve all registered targets after the file has been observed."""
+
+        if self.registry is None:
+            raise TraceFormatError("trace is missing process-group metadata node")
+        record_ids = [record.node_id for record in self._records]
+        resolutions: dict[int, GroupSizeResolution] = {}
+        for target in self._targets:
+            first = bisect_left(record_ids, target.node_id - self.search_window)
+            last = bisect_right(record_ids, target.node_id + self.search_window)
+            candidates = [
+                record
+                for record in self._records[first:last]
+                if target.control_scope & record.control_scope
+            ]
+            candidates.sort(
+                key=lambda record: (
+                    abs(record.node_id - target.node_id),
+                    record.node_id < target.node_id,
+                    record.node_id,
+                )
+            )
+            record = candidates[0] if candidates else None
+            if record is not None and record.pg_id in self.registry:
+                resolutions[target.node_id] = GroupSizeResolution(
+                    group_size=self.registry[record.pg_id],
+                    source="direct",
+                    pg_id=record.pg_id,
+                    record_node_id=record.node_id,
+                    distance=abs(record.node_id - target.node_id),
+                    reason=None,
+                )
+                continue
+
+            reason = "record-param-not-found"
+            pg_id = None
+            record_node_id = None
+            distance = None
+            if record is not None:
+                reason = "pg-id-not-in-metadata"
+                pg_id = record.pg_id
+                record_node_id = record.node_id
+                distance = abs(record.node_id - target.node_id)
+            resolutions[target.node_id] = GroupSizeResolution(
+                group_size=self.model_rank_count if fallback_to_all_ranks else None,
+                source="fallback" if fallback_to_all_ranks else "unresolved",
+                pg_id=pg_id,
+                record_node_id=record_node_id,
+                distance=distance,
+                reason=reason,
+            )
+        return resolutions
+
+
+def resolve_collective_group_sizes(
+    path: Path,
+    model_rank_count: int,
+    target_selector: Callable[[object], bool],
+    protobuf_module=None,
+    *,
+    search_window: int = GROUP_SEARCH_WINDOW,
+    fallback_to_all_ranks: bool = False,
+) -> dict[int, GroupSizeResolution]:
+    """Scan one trace once and resolve selected collective node ids."""
+
+    pb = protobuf_module or load_protobuf_module()
+    resolver = CollectiveGroupResolver(
+        model_rank_count, pb.METADATA_NODE, search_window=search_window
+    )
+    for record in iter_nodes(Path(path), pb):
+        if isinstance(record, pb.GlobalMetadata):
+            continue
+        resolver.observe_node(record, target=target_selector(record))
+    return resolver.resolve(fallback_to_all_ranks=fallback_to_all_ranks)
+
+
+def summarize_group_size_resolutions(
+    resolutions: Iterable[GroupSizeResolution],
+) -> dict[str, object]:
+    """Return JSON-friendly resolution counters and hit rate."""
+
+    items = list(resolutions)
+    sources = Counter(item.source for item in items)
+    reasons = Counter(item.reason for item in items if item.reason is not None)
+    direct = sources["direct"]
+    not_direct = len(items) - direct
+    return {
+        "direct": direct,
+        "fallback": sources["fallback"],
+        "unresolved": sources["unresolved"],
+        "not_direct": not_direct,
+        "hit_rate": direct / len(items) if items else None,
+        "reasons": dict(sorted(reasons.items())),
+    }
 
 
 def load_protobuf_module():
@@ -220,6 +463,24 @@ def derive_comm_size(values: str) -> int:
     return size
 
 
+def round_comm_size(raw_size: int, communicator_group_size: int) -> int:
+    """Round to the nearest ``256 * group_size`` bytes, with a one-unit floor.
+
+    Exact half-unit ties round upward.  This intentionally avoids Python's
+    ties-to-even ``round`` behavior.
+    """
+
+    if raw_size < 0:
+        raise ValueError("raw communication size must be non-negative")
+    if communicator_group_size < 1:
+        raise ValueError("communicator group size must be at least one")
+    unit = 256 * communicator_group_size
+    rounded = max(unit, ((raw_size + unit // 2) // unit) * unit)
+    if rounded > (1 << 63) - 1:
+        raise ValueError("rounded communication size exceeds int64")
+    return rounded
+
+
 def _has_true_cpu_attr(node) -> bool:
     return any(
         attr.name == "is_cpu_op"
@@ -241,12 +502,10 @@ def _set_int64_attr(node, name: str, value: int) -> None:
         attr.int64_val = value
 
 
-def promote_comm_op(node, pb) -> tuple[str | None, int | None, str | None]:
-    """Promote one known CPU NCCL launcher.
-
-    Returns ``(enum_name, size, reason)``.  Non-NCCL nodes return three
-    ``None`` values; an NCCL node left unchanged returns a reason.
-    """
+def inspect_promotable_comm_op(
+    node, pb
+) -> tuple[str | None, int | None, str | None]:
+    """Classify a possible launcher without mutating it."""
 
     if not node.name.startswith("nccl:"):
         return None, None, None
@@ -257,6 +516,26 @@ def promote_comm_op(node, pb) -> tuple[str | None, int | None, str | None]:
         return None, None, "not-cpu-comp-node"
     try:
         size = derive_comm_size(node.inputs.values)
+    except ValueError:
+        return None, None, "communication-size-unavailable"
+    return enum_name, size, None
+
+
+def promote_comm_op(
+    node, pb, communicator_group_size: int
+) -> tuple[str | None, int | None, str | None]:
+    """Promote one known CPU NCCL launcher.
+
+    Returns ``(enum_name, size, reason)``.  Non-NCCL nodes return three
+    ``None`` values; an NCCL node left unchanged returns a reason.
+    """
+
+    enum_name, raw_size, reason = inspect_promotable_comm_op(node, pb)
+    if enum_name is None:
+        return None, None, reason
+    assert raw_size is not None
+    try:
+        size = round_comm_size(raw_size, communicator_group_size)
     except ValueError:
         return None, None, "communication-size-unavailable"
     node.type = pb.COMM_COLL_NODE
@@ -277,6 +556,10 @@ def _empty_stats(rank: int, source: Path, target: Path) -> dict[str, object]:
         "deps_dropped": 0,
         "ops_promoted": 0,
         "ops_left_unmapped": 0,
+        "group_size_resolutions_direct": 0,
+        "group_size_resolutions_fallback": 0,
+        "group_size_resolution_hit_rate": None,
+        "group_size_resolution_fallback_reasons": {},
         "unmapped_names": {},
         "unmapped_reasons": {},
         "bytes_attributed_per_collective_type": {},
@@ -289,6 +572,7 @@ def rewrite_trace(
     passes: Sequence[str],
     rank: int,
     protobuf_module=None,
+    model_rank_count: int | None = None,
 ) -> dict[str, object]:
     """Rewrite one trace atomically and return its provenance counters."""
 
@@ -315,6 +599,29 @@ def rewrite_trace(
     scanned_version: str | None = None
     if "repair-deps" in selected:
         node_ids, scanned_nodes, scanned_version = _scan_node_ids(source, pb)
+
+    group_resolutions: dict[int, GroupSizeResolution] = {}
+    if "promote-comm-ops" in selected:
+        if model_rank_count is None:
+            model_rank_count = infer_model_rank_count(source)
+
+        def promotion_target(node) -> bool:
+            enum_name, _, _ = inspect_promotable_comm_op(node, pb)
+            return enum_name is not None
+
+        group_resolutions = resolve_collective_group_sizes(
+            source,
+            model_rank_count,
+            promotion_target,
+            pb,
+            fallback_to_all_ranks=True,
+        )
+        resolution_summary = summarize_group_size_resolutions(
+            group_resolutions.values()
+        )
+        stats_resolution_summary = resolution_summary
+    else:
+        stats_resolution_summary = None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     stats = _empty_stats(rank, source, target)
@@ -359,7 +666,24 @@ def rewrite_trace(
                         stats["data_deps_dropped"] += original_data - len(kept_data)
 
                     if "promote-comm-ops" in selected:
-                        enum_name, size, reason = promote_comm_op(node, pb)
+                        inspected_enum, _, _ = inspect_promotable_comm_op(node, pb)
+                        resolution = (
+                            group_resolutions.get(int(node.id))
+                            if inspected_enum is not None
+                            else None
+                        )
+                        if inspected_enum is not None and (
+                            resolution is None or resolution.group_size is None
+                        ):
+                            raise TraceFormatError(
+                                f"node {node.id}: missing fallback communicator group size"
+                            )
+                        group_size = (
+                            resolution.group_size if resolution is not None else 1
+                        )
+                        enum_name, size, reason = promote_comm_op(
+                            node, pb, int(group_size)
+                        )
                         if enum_name is not None:
                             stats["ops_promoted"] += 1
                             bytes_by_type[enum_name] += size
@@ -380,6 +704,13 @@ def rewrite_trace(
         stats["bytes_attributed_per_collective_type"] = dict(sorted(bytes_by_type.items()))
         stats["unmapped_names"] = dict(sorted(unmapped_names.items()))
         stats["unmapped_reasons"] = dict(sorted(unmapped_reasons.items()))
+        if stats_resolution_summary is not None:
+            stats["group_size_resolutions_direct"] = stats_resolution_summary["direct"]
+            stats["group_size_resolutions_fallback"] = stats_resolution_summary["fallback"]
+            stats["group_size_resolution_hit_rate"] = stats_resolution_summary["hit_rate"]
+            stats["group_size_resolution_fallback_reasons"] = (
+                stats_resolution_summary["reasons"]
+            )
         os.replace(temporary_name, target)
         temporary_name = None
     finally:
@@ -450,9 +781,32 @@ def discover_inputs(
     return [(rank, available[rank]) for rank in ranks]
 
 
+def infer_model_rank_count(source: Path) -> int:
+    """Infer a model's total ranks from its complete trace directory."""
+
+    source = Path(source)
+    directory = source if source.is_dir() else source.parent
+    ranks = sorted(
+        _parse_rank(path)
+        for path in directory.iterdir()
+        if TRACE_NAME_RE.fullmatch(path.name)
+    )
+    if not ranks:
+        raise ValueError(f"cannot infer model rank count from {directory}")
+    expected = list(range(ranks[-1] + 1))
+    if ranks != expected:
+        raise ValueError(
+            "cannot infer model rank count from a non-contiguous trace directory; "
+            "provide model_rank_count/--model-ranks"
+        )
+    return len(ranks)
+
+
 def _rewrite_task(arguments):
-    source, target, passes, rank = arguments
-    return rewrite_trace(source, target, passes, rank)
+    source, target, passes, rank, model_rank_count = arguments
+    return rewrite_trace(
+        source, target, passes, rank, model_rank_count=model_rank_count
+    )
 
 
 def _tool_git_commit() -> str:
@@ -477,20 +831,38 @@ def _sum_stats(per_rank: Iterable[dict[str, object]]) -> dict[str, object]:
         "deps_dropped",
         "ops_promoted",
         "ops_left_unmapped",
+        "group_size_resolutions_direct",
+        "group_size_resolutions_fallback",
     )
     totals: dict[str, object] = {field: 0 for field in scalar_fields}
     bytes_by_type: Counter[str] = Counter()
     unmapped_names: Counter[str] = Counter()
     unmapped_reasons: Counter[str] = Counter()
+    group_resolution_reasons: Counter[str] = Counter()
     for stats in per_rank:
         for field in scalar_fields:
             totals[field] += stats[field]
         bytes_by_type.update(stats["bytes_attributed_per_collective_type"])
         unmapped_names.update(stats["unmapped_names"])
         unmapped_reasons.update(stats["unmapped_reasons"])
+        group_resolution_reasons.update(
+            stats["group_size_resolution_fallback_reasons"]
+        )
     totals["bytes_attributed_per_collective_type"] = dict(sorted(bytes_by_type.items()))
     totals["unmapped_names"] = dict(sorted(unmapped_names.items()))
     totals["unmapped_reasons"] = dict(sorted(unmapped_reasons.items()))
+    total_resolutions = (
+        totals["group_size_resolutions_direct"]
+        + totals["group_size_resolutions_fallback"]
+    )
+    totals["group_size_resolution_hit_rate"] = (
+        totals["group_size_resolutions_direct"] / total_resolutions
+        if total_resolutions
+        else None
+    )
+    totals["group_size_resolution_fallback_reasons"] = dict(
+        sorted(group_resolution_reasons.items())
+    )
     return totals
 
 
@@ -500,6 +872,7 @@ def rewrite_collection(
     passes: Sequence[str],
     rank_range: tuple[int, int] | None,
     jobs: int,
+    model_rank_count: int | None = None,
 ) -> tuple[Path, dict[str, object]]:
     """Rewrite a file/range and write one deterministic provenance manifest."""
 
@@ -514,13 +887,17 @@ def rewrite_collection(
         raise ValueError("passes must be unique supported pass names")
     if source.is_dir() and source.resolve() == output_dir.resolve():
         raise ValueError("input and output directories must differ")
+    if model_rank_count is None:
+        model_rank_count = infer_model_rank_count(source)
+    elif model_rank_count < 1:
+        raise ValueError("model rank count must be at least one")
     inputs = discover_inputs(source, rank_range)
     output_dir.mkdir(parents=True, exist_ok=True)
     tasks = [
-        (path, output_dir / path.name, selected, rank)
+        (path, output_dir / path.name, selected, rank, model_rank_count)
         for rank, path in inputs
     ]
-    for input_path, output_path, _, _ in tasks:
+    for input_path, output_path, _, _, _ in tasks:
         if input_path.resolve() == output_path.resolve():
             raise ValueError("input and output files must differ")
 
@@ -540,6 +917,7 @@ def rewrite_collection(
         "output_dir": str(output_dir.resolve()),
         "passes_applied": list(selected),
         "ranks": [report["rank"] for report in reports],
+        "model_rank_count": model_rank_count,
         "per_rank": {str(report["rank"]): report for report in reports},
         "totals": _sum_stats(reports),
         "name_to_enum": COMM_NAME_TO_ENUM_NAME if "promote-comm-ops" in selected else {},
@@ -588,6 +966,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="all, RANK, inclusive START-END, or half-open START:END",
     )
     parser.add_argument("--jobs", type=int, default=1, help="parallel rank workers (default: 1)")
+    parser.add_argument(
+        "--model-ranks",
+        type=int,
+        help="total model ranks (default: infer contiguous ranks from input directory)",
+    )
     return parser
 
 
@@ -602,6 +985,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.passes,
             rank_range,
             arguments.jobs,
+            arguments.model_ranks,
         )
     except (FileNotFoundError, RuntimeError, TraceFormatError, ValueError) as error:
         parser.error(str(error))
@@ -611,6 +995,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             sort_keys=True,
         )
     )
+    promoted = int(manifest["totals"]["ops_promoted"])
+    fallback = int(manifest["totals"]["group_size_resolutions_fallback"])
+    if promoted and fallback / promoted >= 0.10:
+        print(
+            "WARNING: communicator group size fell back to all model ranks for "
+            f"{fallback}/{promoted} promoted ops ({fallback / promoted:.1%}); "
+            "this run is not mostly directly resolved",
+            file=sys.stderr,
+        )
     return 0
 
 
