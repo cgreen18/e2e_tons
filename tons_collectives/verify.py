@@ -85,6 +85,9 @@ def verify_schedule(path: Path | str) -> ScheduleReport:
         "reduce_scatter",
         "reduce",
         "broadcast",
+        # A gather carries no reduction, so it is named separately from
+        # "reduce" to keep the reduce-op check below meaningful.
+        "gather",
     }:
         report.errors.append(f"unsupported collective {report.collective!r}")
 

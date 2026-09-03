@@ -143,6 +143,65 @@ Brief implementation notes are appended here by each collaborating agent.
 
 ## 2026-09-03
 
+- **root:** Made ASTRA-sim select topology-aware collective algorithms per
+  *communicator* rather than per collective type, and validated it end to end
+  on a synthetic 128-rank trace. New `per-communicator-custom-implementation`
+  system key maps an exact sorted membership (with a size-keyed fallback) to a
+  pre-computed schedule; `CommunicatorGroup` now consults it. Added
+  `ComType::Broadcast`/`Reduce` wired only to the custom path, so BROADCAST and
+  REDUCE become trivial send/receive trees -- one-to-all, and all-to-one with
+  the reduction compute omitted, i.e. a gather -- while an unregistered
+  communicator keeps the pre-existing replay fallback. Added
+  `tools/chakra_comm_groups.py` (membership from the authoritative process-group
+  registry: 100% of Llama7B rank-0 collectives resolved in 1.1 s versus the
+  existing heuristic profiler's 2.7%), `tools/generate_synthetic_trace.py`,
+  `tools/build_communicator_schedules.py`, `tons_collectives/subgroup.py`, and
+  restricted-demand pMCF (`members=`) proved against a direct LP on the
+  diamond6 fixture. All 18 synthetic runs (3 topologies x 2 backends x
+  ring/direct/pMCF) completed 128/128 ranks; the all-reduce ran on exactly its
+  64-rank group and the all-to-all on all 128. pMCF congestion-aware and
+  congestion-unaware end times are identical to the nanosecond, which is the
+  required no-shared-link-queue acceptance property. Python suite: 70 tests
+  pass (was 39). Results and their limits are in
+  `experiments/synthetic_128/results/RESULTS.md`; no topology comparison or
+  speedup is claimed from them.
+- **root:** Fixed three latent defects found while doing the above.
+  (a) `CommunicatorGroup` sorted a local copy of `involved_NPUs` *after* storing
+  the unsorted one, so `pos_in_group` (which schedule ET a rank loads) and
+  `involved_NPUs` (which real rank an algo rank maps to) could disagree for any
+  trace whose process-group rank list was not already ascending.
+  (b) `astra-sim/common/Common.hh` and `astra-sim/system/Common.hh` are
+  byte-identical and share the include guard `__COMMON_HH__`, so whichever is
+  included first silently wins; both must be edited together. Kept in sync.
+  (c) A Chakra trace whose `METADATA_NODE` is the sole dependency root
+  deadlocks silently: `issue_metadata` completes synchronously without
+  registering a simulator event while `issue_dep_free_nodes` iterates a
+  pre-taken snapshot, so children are freed but never re-scanned and the run
+  ends at tick 0 reporting `complete: false` with no error on stderr. Left
+  ASTRA's scheduler untouched and made the generator emit the metadata node
+  detached, as real PyTorch traces do; documented in
+  `tons_collectives/synthetic_trace.py`. Also note `HardwareResource::is_available`
+  reads `is_cpu_op` with no default and throws when absent, so every emitted
+  node needs it.
+- **root:** Communicator pre-scan of both repaired 128-rank models: Llama7B has
+  2 communicators (both 128-member); MoE8x13B has 117 communicators over sizes
+  {4, 8, 16, 128}, which collapse to only 6 translation-invariant shapes. PT
+  and PDTT are translation-congruent, so one schedule per shape is provably
+  reusable across all its translates; TONS is *not* -- its 16-member
+  `[0,1,2,3,32,...]` shape yields 8 distinct reduced sub-maps across its 8
+  groups, because optical/twisted links break translation symmetry. Scattered
+  groups (`[0,32,64,96]`) have disconnected induced subgraphs on every topology
+  and need the proximity sub-map at radius 2 (radius 4 on TONS). This is why
+  the selection key is exact membership, not communicator size.
+- **root:** Restricted-demand all-to-all cannot relay through non-members. A
+  k-rank collective ET can only name algo ranks 0..k-1, and ASTRA instantiates
+  a collective algorithm only on ranks that execute the collective node, so a
+  non-member router can never be woken up to forward a chunk. pMCF candidate
+  paths are therefore filtered to member-only intermediates and the schedule is
+  relabelled into algo-rank space. Waking non-participants would need new
+  `Sys`/`Workload` support and was not attempted; recorded in
+  `docs/communicator_aware_collectives_plan.md`.
+
 - **root:** Hardened Chakra `promote-comm-ops` sizing by resolving each
   launcher's communicator from the trace-local process-group metadata and a
   bounded shared-control-scope `record_param_comms` correlation, falling back

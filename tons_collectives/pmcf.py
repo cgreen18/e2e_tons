@@ -30,6 +30,10 @@ class PmcfResult:
     candidates: str
     subchunks: int
     seed: int
+    # Communicator membership in physical rank ids, or None for the full
+    # machine.  Part of the cache key: a schedule solved for one communicator
+    # is not valid for another.
+    members: list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -94,12 +98,23 @@ def _read_map(path: Path) -> list[list[int]]:
 
 
 def _read_candidates(
-    path: Path, topology: list[list[int]]
+    path: Path, topology: list[list[int]], members: list[int] | None = None
 ) -> tuple[list[list[int]], dict[tuple[int, int], list[int]], dict[tuple[int, int], list[int]]]:
+    """Read the CPL-safe candidate paths, optionally restricted to a subset.
+
+    When ``members`` is given, only paths whose endpoints *and intermediate
+    routers* are all members are retained.  ASTRA instantiates a collective
+    algorithm only on the ranks that execute the collective node, so a
+    non-member router can never be woken up to forward a chunk; admitting a
+    path that relays through one would produce a schedule that deadlocks.
+    Link capacities still come from the full topology.
+    """
+
     candidates: list[list[int]] = []
     by_commodity: dict[tuple[int, int], list[int]] = defaultdict(list)
     by_edge: dict[tuple[int, int], list[int]] = defaultdict(list)
     ranks = len(topology)
+    member_set = None if members is None else set(members)
     with path.open(encoding="utf-8") as stream:
         for line_number, raw in enumerate(stream, start=1):
             if not raw.strip():
@@ -114,6 +129,8 @@ def _read_candidates(
                 raise ValueError(f"{path}:{line_number}: router outside [0, {ranks})")
             if len(set(route)) != len(route):
                 raise ValueError(f"{path}:{line_number}: route is not simple")
+            if member_set is not None and not member_set.issuperset(route):
+                continue
             index = len(candidates)
             for source, destination in zip(route, route[1:]):
                 if not topology[source][destination]:
@@ -123,10 +140,22 @@ def _read_candidates(
                 by_edge[(source, destination)].append(index)
             candidates.append(route)
             by_commodity[(route[0], route[-1])].append(index)
-    expected = {(source, destination) for source in range(ranks) for destination in range(ranks) if source != destination}
+    universe = range(ranks) if members is None else members
+    expected = {
+        (source, destination)
+        for source in universe
+        for destination in universe
+        if source != destination
+    }
     missing = expected - set(by_commodity)
     if missing:
-        raise ValueError(f"{path}: missing {len(missing)} ordered commodities")
+        detail = f"{len(missing)} ordered commodities"
+        if members is not None:
+            detail += (
+                " have no candidate path that stays inside the communicator; "
+                "the member-induced subgraph cannot carry a restricted all-to-all"
+            )
+        raise ValueError(f"{path}: missing {detail}")
     return candidates, dict(by_commodity), dict(by_edge)
 
 
@@ -168,11 +197,25 @@ def generate_pmcf_alltoall(
     threads: int = 16,
     seed: int = 1,
     reuse: bool = False,
+    members: list[int] | None = None,
 ) -> PmcfResult:
-    """Solve pMCF, quantize it, and emit a causal hop-by-hop MSCCL schedule."""
+    """Solve pMCF, quantize it, and emit a causal hop-by-hop MSCCL schedule.
+
+    ``members`` restricts the demand matrix to ordered pairs drawn from one
+    communicator.  The solve still runs over the full topology's directed link
+    capacities, but only member-only candidate paths are admitted, and the
+    emitted schedule is relabelled into algo-rank space ``0..k-1`` because
+    ASTRA loads one schedule ET per position in the communicator.
+    """
 
     if subchunks < 1:
         raise ValueError("subchunks must be positive")
+    if members is not None:
+        members = sorted(members)
+        if len(set(members)) != len(members):
+            raise ValueError("communicator members must be unique")
+        if len(members) < 2:
+            raise ValueError("a restricted all-to-all needs at least two members")
     topology_path = Path(topology_path)
     candidates_path = Path(candidates_path)
     output = Path(output)
@@ -184,6 +227,7 @@ def generate_pmcf_alltoall(
             "candidates": str(candidates_path.resolve()),
             "subchunks": subchunks,
             "solver": solver,
+            "members": members,
         }
         fields = set(PmcfResult.__dataclass_fields__)
         # A report written before the certification fields existed cannot be
@@ -199,7 +243,15 @@ def generate_pmcf_alltoall(
             )
     topology = _read_map(topology_path)
     ranks = len(topology)
-    candidates, by_commodity, by_edge = _read_candidates(candidates_path, topology)
+    candidates, by_commodity, by_edge = _read_candidates(
+        candidates_path, topology, members
+    )
+    if members is not None:
+        for member in members:
+            if not 0 <= member < ranks:
+                raise ValueError(
+                    f"member {member} is outside the {ranks}-router topology"
+                )
 
     if solver == "highs":
         solution = _solve_highs(candidates, by_commodity, by_edge, ranks)
@@ -216,14 +268,28 @@ def generate_pmcf_alltoall(
     quantized_load: Counter[tuple[int, int]] = Counter()
     for _, _, _, route in assignments:
         quantized_load.update(zip(route, route[1:]))
+    if members is None:
+        schedule_ranks = ranks
+    else:
+        algo_index = {member: index for index, member in enumerate(members)}
+        assignments = [
+            (
+                algo_index[source],
+                algo_index[destination],
+                q,
+                [algo_index[node] for node in route],
+            )
+            for source, destination, q, route in assignments
+        ]
+        schedule_ranks = len(members)
     transfers = _compile_assigned_transfers(assignments)
     schedule = _generate_routed_alltoall(
-        transfers, ranks, subchunks, "tons_pmcf_alltoall", output
+        transfers, schedule_ranks, subchunks, "tons_pmcf_alltoall", output
     )
     result = PmcfResult(
         schedule=schedule.resolve(),
         report=report_path.resolve(),
-        ranks=ranks,
+        ranks=schedule_ranks,
         candidate_paths=len(candidates),
         active_paths=solution.active_paths,
         positive_paths=sum(value > 1e-12 for value in values.values()),
@@ -238,6 +304,7 @@ def generate_pmcf_alltoall(
         candidates=str(candidates_path.resolve()),
         subchunks=subchunks,
         seed=seed,
+        members=None if members is None else list(members),
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(

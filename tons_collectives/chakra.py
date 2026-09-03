@@ -76,11 +76,21 @@ class ChakraNode:
     node_type: int
     dependencies: list[int] = field(default_factory=list)
     attributes: list[tuple[str, int | bool | str, str]] = field(default_factory=list)
+    # ``Node.duration_micros``.  ASTRA replays a node for this long when the
+    # roofline model is disabled, which is how synthetic compute nodes get a
+    # non-trivial runtime.
+    duration_micros: int = 0
+    # ``Node.inputs.values``.  Only process-group metadata nodes need it.
+    inputs_values: str | None = None
 
     def serialize(self) -> bytes:
         message = _integer(1, self.node_id) + _string(2, self.name) + _integer(3, self.node_type)
         for dependency in self.dependencies:
             message += _integer(5, dependency)
+        if self.duration_micros:
+            message += _integer(7, self.duration_micros)
+        if self.inputs_values is not None:
+            message += _bytes(8, _string(1, self.inputs_values))
         for name, value, kind in self.attributes:
             message += _bytes(10, _attribute(name, value, kind))
         return message
