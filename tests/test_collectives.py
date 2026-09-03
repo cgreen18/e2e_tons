@@ -226,3 +226,86 @@ class CollectiveScheduleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestrictedPmcfTest(unittest.TestCase):
+    """pMCF over a communicator subset with member-only relays."""
+
+    MEMBERS = [0, 1, 4]
+
+    def _member_only_columns(self, candidates: list[list[int]]) -> list[int]:
+        members = set(self.MEMBERS)
+        return [
+            index
+            for index, route in enumerate(candidates)
+            if members.issuperset(route)
+        ]
+
+    def test_restricted_solve_matches_direct_lp_over_the_subset(self) -> None:
+        topology = _read_map(FIXTURES / "diamond6.map")
+        # The full candidate set, so the reference LP can pick the member-only
+        # columns itself rather than trusting the filter under test.
+        candidates, _, _ = _read_candidates(FIXTURES / "diamond6.rallpaths", topology)
+        columns = self._member_only_columns(candidates)
+        self.assertTrue(columns, "fixture has no member-only paths")
+        expected, _ = _reference_concurrent_flow(candidates, columns)
+
+        with TemporaryDirectory() as temporary:
+            result = generate_pmcf_alltoall(
+                FIXTURES / "diamond6.map",
+                FIXTURES / "diamond6.rallpaths",
+                subchunks=2,
+                output=Path(temporary) / "restricted.xml",
+                solver="highs",
+                members=self.MEMBERS,
+            )
+        self.assertAlmostEqual(result.maximum_concurrent_flow, expected, places=9)
+        self.assertEqual(result.members, self.MEMBERS)
+        # The schedule is emitted in algo-rank space, not physical space.
+        self.assertEqual(result.ranks, len(self.MEMBERS))
+
+    def test_restricted_schedule_verifies_and_stays_inside_the_communicator(self) -> None:
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary) / "restricted.xml"
+            generate_pmcf_alltoall(
+                FIXTURES / "diamond6.map",
+                FIXTURES / "diamond6.rallpaths",
+                subchunks=2,
+                output=output,
+                solver="highs",
+                members=self.MEMBERS,
+            )
+            report = verify_schedule(output)
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.ranks, len(self.MEMBERS))
+            self.assertEqual(report.sends, report.receives)
+
+            root = ET.parse(output).getroot()
+            peers = set()
+            for gpu in root.findall("gpu"):
+                for tb in gpu.findall("tb"):
+                    for key in ("send", "recv"):
+                        peer = int(tb.attrib[key])
+                        if peer >= 0:
+                            peers.add(peer)
+            # Every endpoint is an algo rank, so no non-member router is ever
+            # asked to relay.
+            self.assertTrue(peers <= set(range(len(self.MEMBERS))), peers)
+
+            lowered = lower_msccl_to_chakra(output, Path(temporary) / "restricted")
+            self.assertEqual(len(lowered), len(self.MEMBERS))
+
+    def test_communicator_without_internal_paths_is_rejected(self) -> None:
+        # Nodes 0 and 1 are on the same side of the bipartite fixture, so no
+        # path between them avoids a non-member relay.
+        with TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError) as caught:
+                generate_pmcf_alltoall(
+                    FIXTURES / "diamond6.map",
+                    FIXTURES / "diamond6.rallpaths",
+                    subchunks=2,
+                    output=Path(temporary) / "impossible.xml",
+                    solver="highs",
+                    members=[0, 1],
+                )
+        self.assertIn("stays inside the communicator", str(caught.exception))

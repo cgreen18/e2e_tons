@@ -1,3 +1,23 @@
+diff --git a/astra-sim/common/Common.hh b/astra-sim/common/Common.hh
+index 8dc7696..c74184e 100644
+--- a/astra-sim/common/Common.hh
++++ b/astra-sim/common/Common.hh
+@@ -46,7 +46,14 @@ enum class ComType {
+     All_Gather,
+     All_Reduce,
+     All_to_All,
+-    All_Reduce_All_to_All
++    All_Reduce_All_to_All,
++    // Broadcast and Reduce are supported only through custom collective
++    // algorithms.  There is no native implementation for either; when no
++    // custom algorithm is registered the workload layer falls back to
++    // replaying the traced duration, which is the pre-existing behaviour.
++    // Appended last so the values of the entries above are unchanged.
++    Broadcast,
++    Reduce
+ };
+ 
+ enum class CollectiveOptimization { Baseline = 0, LocalBWAware };
 diff --git a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc b/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
 index 8f3746f..77830fd 100644
 --- a/astra-sim/network_frontend/analytical/common/CmdLineParser.cc
@@ -212,11 +232,181 @@ index 0000000..527f48f
 +        links = {});
 +
 +}  // namespace AstraSimAnalytical
+diff --git a/astra-sim/system/Common.hh b/astra-sim/system/Common.hh
+index 8dc7696..c74184e 100644
+--- a/astra-sim/system/Common.hh
++++ b/astra-sim/system/Common.hh
+@@ -46,7 +46,14 @@ enum class ComType {
+     All_Gather,
+     All_Reduce,
+     All_to_All,
+-    All_Reduce_All_to_All
++    All_Reduce_All_to_All,
++    // Broadcast and Reduce are supported only through custom collective
++    // algorithms.  There is no native implementation for either; when no
++    // custom algorithm is registered the workload layer falls back to
++    // replaying the traced duration, which is the pre-existing behaviour.
++    // Appended last so the values of the entries above are unchanged.
++    Broadcast,
++    Reduce
+ };
+ 
+ enum class CollectiveOptimization { Baseline = 0, LocalBWAware };
+diff --git a/astra-sim/system/CommunicatorGroup.cc b/astra-sim/system/CommunicatorGroup.cc
+index bd88555..1145572 100644
+--- a/astra-sim/system/CommunicatorGroup.cc
++++ b/astra-sim/system/CommunicatorGroup.cc
+@@ -16,9 +16,15 @@ CommunicatorGroup::CommunicatorGroup(int comm_group_id,
+                                      std::vector<int> involved_NPUs,
+                                      Sys* generator) {
+     set_id(comm_group_id);
+-    this->involved_NPUs = involved_NPUs;
+     this->generator = generator;
++    // Sort the stored membership, not a local copy.  `pos_in_group` selects
++    // which per-position schedule ET this rank loads, while
++    // CustomAlgorithm::convert_algo_rank_to_real_rank indexes
++    // `involved_NPUs` to turn an algo rank back into a real rank.  If only
++    // one of the two were sorted, a trace whose process-group rank list is
++    // not already ascending would map algo ranks onto the wrong NPUs.
+     std::sort(involved_NPUs.begin(), involved_NPUs.end());
++    this->involved_NPUs = involved_NPUs;
+ 
+     // -1 means the rank is not in the comm group.
+     int position = -1;
+@@ -55,7 +61,8 @@ CollectivePlan* CommunicatorGroup::get_collective_plan(ComType comm_type, uint64
+         LogicalTopology* logical_topology =
+             generator->get_logical_topology(comm_type);
+         std::vector<CollectiveImpl*> collective_implementation =
+-            generator->collective_impl_lookup->get_collective_impl(comm_type, workload_node_id);
++            generator->collective_impl_lookup->get_collective_impl_for_communicator(
++                comm_type, workload_node_id, involved_NPUs);
+         std::vector<bool> dimensions_involved(10, true);
+         bool should_be_removed = false;
+         comm_plans[comm_type] =
+@@ -64,7 +71,8 @@ CollectivePlan* CommunicatorGroup::get_collective_plan(ComType comm_type, uint64
+         return comm_plans[comm_type];
+     } else {
+         std::vector<CollectiveImpl*> collective_implementation =
+-            generator->collective_impl_lookup->get_collective_impl(comm_type, workload_node_id);
++            generator->collective_impl_lookup->get_collective_impl_for_communicator(
++                comm_type, workload_node_id, involved_NPUs);
+         if (collective_implementation.size() > 1) {
+             // This means that everything fell through and we got a native collective that is multi-dimensional.
+             // (Custom collective always assumes 1 dimension).
 diff --git a/astra-sim/system/Sys.cc b/astra-sim/system/Sys.cc
-index d2a279b..19bbfc8 100644
+index d2a279b..57a02f0 100644
 --- a/astra-sim/system/Sys.cc
 +++ b/astra-sim/system/Sys.cc
-@@ -997,7 +997,10 @@ CollectivePhase Sys::generate_collective_phase(
+@@ -579,7 +579,9 @@ DataSet* Sys::generate_all_reduce(uint64_t size,
+                                   uint64_t workload_node_id) {
+     if (communicator_group == nullptr) {
+         vector<CollectiveImpl*> implementation_per_dimension;
+-        implementation_per_dimension = collective_impl_lookup->get_collective_impl(ComType::All_Reduce, workload_node_id);
++        implementation_per_dimension =
++            collective_impl_lookup->get_collective_impl_for_communicator(
++                ComType::All_Reduce, workload_node_id, default_communicator());
+         return generate_collective(size, logical_topologies["AllReduce"],
+                                    implementation_per_dimension,
+                                    involved_dimensions, ComType::All_Reduce,
+@@ -601,7 +603,9 @@ DataSet* Sys::generate_all_to_all(uint64_t size,
+                                   uint64_t workload_node_id) {
+     if (communicator_group == nullptr) {
+         vector<CollectiveImpl*> implementation_per_dimension;
+-        implementation_per_dimension = collective_impl_lookup->get_collective_impl(ComType::All_to_All, workload_node_id);
++        implementation_per_dimension =
++            collective_impl_lookup->get_collective_impl_for_communicator(
++                ComType::All_to_All, workload_node_id, default_communicator());
+         return generate_collective(size, logical_topologies["AllToAll"],
+                                    implementation_per_dimension,
+                                    involved_dimensions, ComType::All_to_All,
+@@ -623,7 +627,9 @@ DataSet* Sys::generate_all_gather(uint64_t size,
+                                   uint64_t workload_node_id) {
+     if (communicator_group == nullptr) {
+         vector<CollectiveImpl*> implementation_per_dimension;
+-        implementation_per_dimension = collective_impl_lookup->get_collective_impl(ComType::All_Gather, workload_node_id);
++        implementation_per_dimension =
++            collective_impl_lookup->get_collective_impl_for_communicator(
++                ComType::All_Gather, workload_node_id, default_communicator());
+         return generate_collective(size, logical_topologies["AllGather"],
+                                    implementation_per_dimension,
+                                    involved_dimensions, ComType::All_Gather,
+@@ -645,7 +651,9 @@ DataSet* Sys::generate_reduce_scatter(uint64_t size,
+                                       uint64_t workload_node_id) {
+     if (communicator_group == nullptr) {
+         vector<CollectiveImpl*> implementation_per_dimension;
+-        implementation_per_dimension = collective_impl_lookup->get_collective_impl(ComType::Reduce_Scatter, workload_node_id);
++        implementation_per_dimension =
++            collective_impl_lookup->get_collective_impl_for_communicator(
++                ComType::Reduce_Scatter, workload_node_id, default_communicator());
+         return generate_collective(size, logical_topologies["ReduceScatter"],
+                                    implementation_per_dimension,
+                                    involved_dimensions, ComType::Reduce_Scatter,
+@@ -660,6 +668,64 @@ DataSet* Sys::generate_reduce_scatter(uint64_t size,
+     }
+ }
+ 
++// Broadcast and Reduce have no native ASTRA implementation.  They reach this
++// point only when the workload layer has already confirmed that a custom
++// algorithm is registered for this communicator, so no logical topology is
++// required: the custom branch of generate_collective ignores it.
++DataSet* Sys::generate_broadcast(uint64_t size,
++                                 vector<bool> involved_dimensions,
++                                 CommunicatorGroup* communicator_group,
++                                 int explicit_priority,
++                                 uint64_t workload_node_id) {
++    return generate_structural_collective(size, involved_dimensions,
++                                          communicator_group, explicit_priority,
++                                          workload_node_id, ComType::Broadcast);
++}
++
++DataSet* Sys::generate_reduce(uint64_t size,
++                              vector<bool> involved_dimensions,
++                              CommunicatorGroup* communicator_group,
++                              int explicit_priority,
++                              uint64_t workload_node_id) {
++    return generate_structural_collective(size, involved_dimensions,
++                                          communicator_group, explicit_priority,
++                                          workload_node_id, ComType::Reduce);
++}
++
++DataSet* Sys::generate_structural_collective(
++    uint64_t size,
++    vector<bool> involved_dimensions,
++    CommunicatorGroup* communicator_group,
++    int explicit_priority,
++    uint64_t workload_node_id,
++    ComType collective_type) {
++    vector<CollectiveImpl*> implementation_per_dimension =
++        collective_impl_lookup->get_collective_impl_for_communicator(
++            collective_type, workload_node_id,
++            communicator_group == nullptr ? default_communicator()
++                                          : communicator_group->involved_NPUs);
++    if (implementation_per_dimension.empty() ||
++        implementation_per_dimension[0]->type !=
++            CollectiveImplType::CustomCollectiveImpl) {
++        LoggerFactory::get_logger("system")->critical(
++            "Broadcast/Reduce require a custom collective algorithm; none is "
++            "registered for this communicator");
++        exit(1);
++    }
++    return generate_collective(size, nullptr, implementation_per_dimension,
++                               involved_dimensions, collective_type,
++                               explicit_priority, communicator_group);
++}
++
++// Membership of the implicit default communicator: every rank.
++std::vector<int> Sys::default_communicator() const {
++    std::vector<int> all(total_nodes);
++    for (int i = 0; i < total_nodes; ++i) {
++        all[i] = i;
++    }
++    return all;
++}
++
+ DataSet* Sys::generate_collective(
+     uint64_t size,
+     LogicalTopology* topology,
+@@ -997,7 +1063,10 @@ CollectivePhase Sys::generate_collective_phase(
          return vn;
      } else if (collective_impl->type == CollectiveImplType::CustomCollectiveImpl) {
          string filename = ((CustomCollectiveImpl*)collective_impl)->filename;
@@ -228,6 +418,334 @@ index d2a279b..19bbfc8 100644
          return vn;
      } else {
          LoggerFactory::get_logger("system")->critical(
+diff --git a/astra-sim/system/Sys.hh b/astra-sim/system/Sys.hh
+index 7336481..7bb3275 100644
+--- a/astra-sim/system/Sys.hh
++++ b/astra-sim/system/Sys.hh
+@@ -143,6 +143,26 @@ class Sys : public Callable {
+                                      CommunicatorGroup* communicator_group,
+                                      int explicit_priority,
+                                      uint64_t workload_node_id = -1);
++    // Broadcast and Reduce are simulated only via a custom collective
++    // algorithm; there is no native implementation for either.
++    DataSet* generate_broadcast(uint64_t size,
++                                std::vector<bool> involved_dimensions,
++                                CommunicatorGroup* communicator_group,
++                                int explicit_priority,
++                                uint64_t workload_node_id = -1);
++    DataSet* generate_reduce(uint64_t size,
++                             std::vector<bool> involved_dimensions,
++                             CommunicatorGroup* communicator_group,
++                             int explicit_priority,
++                             uint64_t workload_node_id = -1);
++    DataSet* generate_structural_collective(uint64_t size,
++                                            std::vector<bool> involved_dimensions,
++                                            CommunicatorGroup* communicator_group,
++                                            int explicit_priority,
++                                            uint64_t workload_node_id,
++                                            ComType collective_type);
++    // Membership of the implicit default communicator: every rank.
++    std::vector<int> default_communicator() const;
+     DataSet* generate_collective(
+         uint64_t size,
+         LogicalTopology* topology,
+diff --git a/astra-sim/system/astraccl/CollectiveImplLookup.cc b/astra-sim/system/astraccl/CollectiveImplLookup.cc
+index 7843d4e..5486ed8 100644
+--- a/astra-sim/system/astraccl/CollectiveImplLookup.cc
++++ b/astra-sim/system/astraccl/CollectiveImplLookup.cc
+@@ -5,6 +5,7 @@ LICENSE file in the root directory of this source tree.
+ 
+ #include "astra-sim/system/astraccl/CollectiveImplLookup.hh"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <yaml-cpp/yaml.h>
+ 
+@@ -89,6 +90,184 @@ namespace AstraSim {
+         return result;
+     }
+ 
++    // Maps the Chakra collective names used in the per-communicator YAML onto
++    // ASTRA's internal ComType.  The YAML deliberately uses Chakra's spelling
++    // so the file can be generated straight from a trace pre-scan.
++    static const std::map<std::string, ComType>& collective_name_to_comtype() {
++        static const std::map<std::string, ComType> table = {
++            {"ALL_REDUCE", ComType::All_Reduce},
++            {"ALL_GATHER", ComType::All_Gather},
++            {"REDUCE_SCATTER", ComType::Reduce_Scatter},
++            {"ALL_TO_ALL", ComType::All_to_All},
++            {"BROADCAST", ComType::Broadcast},
++            {"REDUCE", ComType::Reduce},
++        };
++        return table;
++    }
++
++    void CollectiveImplLookup::parse_per_communicator_yaml_file(
++        const std::string& yaml_filepath) {
++        YAML::Node root;
++        try {
++            root = YAML::LoadFile(yaml_filepath);
++        } catch (const YAML::BadFile& e) {
++            throw std::runtime_error(
++                "Failed to open per-communicator YAML file: " + yaml_filepath);
++        } catch (const YAML::ParserException& e) {
++            throw std::runtime_error(
++                std::string("per-communicator YAML parse error: ") + e.what());
++        }
++        if (!root || !root.IsMap()) {
++            throw std::runtime_error(
++                "per-communicator YAML must map a collective name to its groups");
++        }
++
++        for (const auto& entry : root) {
++            const std::string collective = entry.first.as<std::string>();
++            const auto it = collective_name_to_comtype().find(collective);
++            if (it == collective_name_to_comtype().end()) {
++                throw std::runtime_error(
++                    "per-communicator YAML has an unknown collective name: " +
++                    collective);
++            }
++            const ComType comm_type = it->second;
++            const YAML::Node& body = entry.second;
++            if (!body || !body.IsMap()) {
++                throw std::runtime_error(
++                    "per-communicator YAML entry " + collective +
++                    " must be a mapping with 'groups' and/or 'sizes'");
++            }
++
++            if (body["groups"]) {
++                if (!body["groups"].IsSequence()) {
++                    throw std::runtime_error(
++                        "per-communicator YAML 'groups' must be a sequence");
++                }
++                for (const auto& group : body["groups"]) {
++                    if (!group["ranks"] || !group["ranks"].IsSequence() ||
++                        !group["algorithm"]) {
++                        throw std::runtime_error(
++                            "per-communicator YAML group needs 'ranks' and "
++                            "'algorithm'");
++                    }
++                    std::vector<int> ranks =
++                        group["ranks"].as<std::vector<int>>();
++                    if (ranks.empty()) {
++                        throw std::runtime_error(
++                            "per-communicator YAML group has no ranks");
++                    }
++                    // Membership is the lookup key, so it must be canonical.
++                    // CommunicatorGroup sorts involved_NPUs the same way.
++                    std::sort(ranks.begin(), ranks.end());
++                    if (std::adjacent_find(ranks.begin(), ranks.end()) !=
++                        ranks.end()) {
++                        throw std::runtime_error(
++                            "per-communicator YAML group has duplicate ranks");
++                    }
++                    const std::string algorithm =
++                        group["algorithm"].as<std::string>();
++                    auto& by_membership = per_communicator_custom_impl[comm_type];
++                    if (by_membership.find(ranks) != by_membership.end()) {
++                        throw std::runtime_error(
++                            "per-communicator YAML declares " + collective +
++                            " twice for the same communicator membership");
++                    }
++                    by_membership[ranks] =
++                        generate_custom_collective_impl(algorithm, rank);
++                }
++            }
++
++            if (body["sizes"]) {
++                if (!body["sizes"].IsMap()) {
++                    throw std::runtime_error(
++                        "per-communicator YAML 'sizes' must be a mapping of "
++                        "size to algorithm");
++                }
++                for (const auto& sized : body["sizes"]) {
++                    const int size = sized.first.as<int>();
++                    if (size <= 0) {
++                        throw std::runtime_error(
++                            "per-communicator YAML size must be positive");
++                    }
++                    const std::string algorithm = sized.second.as<std::string>();
++                    per_communicator_size_custom_impl[comm_type]
++                                                     [static_cast<size_t>(size)] =
++                        generate_custom_collective_impl(algorithm, rank);
++                }
++            }
++        }
++    }
++
++    std::vector<CollectiveImpl*>
++    CollectiveImplLookup::get_collective_impl_for_communicator(
++        ComType comm_type,
++        uint64_t workload_node_id,
++        const std::vector<int>& involved_NPUs,
++        BypassRule bypass_rule) {
++
++        if (bypass_rule != BypassRule::BYPASS_ALL_CUSTOM &&
++            !involved_NPUs.empty()) {
++            // A per-node override still wins, matching the priority order
++            // documented on this class.
++            if (bypass_rule != BypassRule::BYPASS_PERNODE_CUSTOM) {
++                auto it = per_node_custom_impl.find(
++                    static_cast<int>(workload_node_id));
++                if (it != per_node_custom_impl.end()) {
++                    return std::vector<CollectiveImpl*>{it->second};
++                }
++            }
++
++            std::vector<int> key = involved_NPUs;
++            std::sort(key.begin(), key.end());
++
++            auto exact = per_communicator_custom_impl.find(comm_type);
++            if (exact != per_communicator_custom_impl.end()) {
++                auto hit = exact->second.find(key);
++                if (hit != exact->second.end()) {
++                    return std::vector<CollectiveImpl*>{hit->second};
++                }
++            }
++
++            auto sized = per_communicator_size_custom_impl.find(comm_type);
++            if (sized != per_communicator_size_custom_impl.end()) {
++                auto hit = sized->second.find(key.size());
++                if (hit != sized->second.end()) {
++                    return std::vector<CollectiveImpl*>{hit->second};
++                }
++            }
++        }
++
++        return get_collective_impl(comm_type, workload_node_id, bypass_rule);
++    }
++
++    bool CollectiveImplLookup::has_custom_impl_for_communicator(
++        ComType comm_type,
++        uint64_t workload_node_id,
++        const std::vector<int>& involved_NPUs) {
++
++        if (per_node_custom_impl.find(static_cast<int>(workload_node_id)) !=
++            per_node_custom_impl.end()) {
++            return true;
++        }
++        if (global_custom_impl_per_coll.find(comm_type) !=
++            global_custom_impl_per_coll.end()) {
++            return true;
++        }
++        std::vector<int> key = involved_NPUs;
++        std::sort(key.begin(), key.end());
++        auto exact = per_communicator_custom_impl.find(comm_type);
++        if (exact != per_communicator_custom_impl.end() &&
++            exact->second.find(key) != exact->second.end()) {
++            return true;
++        }
++        auto sized = per_communicator_size_custom_impl.find(comm_type);
++        if (sized != per_communicator_size_custom_impl.end() &&
++            sized->second.find(key.size()) != sized->second.end()) {
++            return true;
++        }
++        return false;
++    }
++
+     void CollectiveImplLookup::setup_collective_impl_from_config(json j) {
+         // This function is intentionally rolled out (multiple if statements
+         // instead of for loop across colls) to provide better code clarity.
+@@ -179,6 +358,40 @@ namespace AstraSim {
+             global_custom_impl_per_coll[ComType::All_Reduce] = ci;
+         }
+ 
++        // Broadcast and Reduce have no native implementation; a custom
++        // algorithm is the only way to simulate them rather than replay them.
++        if (j.contains("broadcast-implementation-custom")) {
++            vector<string> chakra_filepath_str_vec =
++                j["broadcast-implementation-custom"];
++            if (chakra_filepath_str_vec.size() != 1) {
++                throw logic_error(
++                    "There should be 1 Chakra ET only. In multi-dim collectives, "
++                    "that 1 ET file covers all dimensions");
++            }
++            CollectiveImpl* ci =
++                generate_custom_collective_impl(chakra_filepath_str_vec[0], rank);
++            global_custom_impl_per_coll[ComType::Broadcast] = ci;
++        }
++        if (j.contains("reduce-implementation-custom")) {
++            vector<string> chakra_filepath_str_vec =
++                j["reduce-implementation-custom"];
++            if (chakra_filepath_str_vec.size() != 1) {
++                throw logic_error(
++                    "There should be 1 Chakra ET only. In multi-dim collectives, "
++                    "that 1 ET file covers all dimensions");
++            }
++            CollectiveImpl* ci =
++                generate_custom_collective_impl(chakra_filepath_str_vec[0], rank);
++            global_custom_impl_per_coll[ComType::Reduce] = ci;
++        }
++
++        // 2b. Parse the per-communicator custom collectives.  These sit
++        // between the per-node and the global per-collective tiers.
++        if (j.contains("per-communicator-custom-implementation")) {
++            string path = j["per-communicator-custom-implementation"];
++            parse_per_communicator_yaml_file(path);
++        }
++
+         // 3. Finally, parse the list of per-chakra-node custom collective algorithm.
+         // These have the highest priority.
+         if (j.contains("per-node-custom-implementation")) {
+diff --git a/astra-sim/system/astraccl/CollectiveImplLookup.hh b/astra-sim/system/astraccl/CollectiveImplLookup.hh
+index ea6ffb3..9eeb2bf 100644
+--- a/astra-sim/system/astraccl/CollectiveImplLookup.hh
++++ b/astra-sim/system/astraccl/CollectiveImplLookup.hh
+@@ -44,7 +44,31 @@ class CollectiveImplLookup {
+             BypassRule bypass_rule = BypassRule::NO_BYPASS
+         );
+ 
++        // Communicator-aware lookup.  `involved_NPUs` is the communicator's
++        // membership; it selects a topology-aware algorithm that was
++        // pre-computed for exactly that set of ranks, falling back to a
++        // size-keyed algorithm and then to the communicator-agnostic lookup
++        // above.  Ctrl+F for [communicator specific custom collective].
++        std::vector<CollectiveImpl*> get_collective_impl_for_communicator(
++            ComType comm_type,
++            uint64_t workload_node_id,
++            const std::vector<int>& involved_NPUs,
++            BypassRule bypass_rule = BypassRule::NO_BYPASS
++        );
++
++        // True when any custom algorithm could serve this communicator.  The
++        // workload layer uses it to decide whether Broadcast/Reduce can be
++        // simulated or must fall back to replay.
++        bool has_custom_impl_for_communicator(
++            ComType comm_type,
++            uint64_t workload_node_id,
++            const std::vector<int>& involved_NPUs
++        );
++
+     private:
++        // Loads the exact-membership and size-keyed algorithm tables.
++        void parse_per_communicator_yaml_file(const std::string& yaml_filepath);
++
+         // Map from Chakra node id (integer) to a custom algorithm identifier/filepath.
+         // Populated from YAML file. The filename is specified in the system input with the key "per-node-custom-implementation".
+         std::map<int, CollectiveImpl*> per_node_custom_impl;
+@@ -54,6 +78,22 @@ class CollectiveImplLookup {
+         // The filename of the Chakra ET for the specific custom algorithm is specified in the system input with the key "all-reduce-implementation-custom".
+         std::map<ComType, CollectiveImpl*> global_custom_impl_per_coll;
+ 
++        // [communicator specific custom collective]
++        // Map from Collective Type to the algorithms pre-computed for one
++        // exact communicator membership.  A topology-aware algorithm is only
++        // valid for the placement it was solved for, so the sorted rank list
++        // -- not merely its size -- is the key.  Populated from the YAML file
++        // named by the system input key
++        // "per-communicator-custom-implementation".
++        std::map<ComType, std::map<std::vector<int>, CollectiveImpl*>>
++            per_communicator_custom_impl;
++
++        // Fallback keyed only on communicator size, for the common case where
++        // one algorithm is deliberately replicated across every group of that
++        // size.  Consulted only when no exact membership matches.
++        std::map<ComType, std::map<size_t, CollectiveImpl*>>
++            per_communicator_size_custom_impl;
++
+         // Map from Collective Type to a vector of native algorithms, where
+         // each element in the vector corresponds to a dimension.
+         // To be applied only if no custom algorithm is specified.
 diff --git a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc b/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
 index e6351fb..1d9544d 100644
 --- a/astra-sim/system/astraccl/custom_collectives/CustomAlgorithm.cc
@@ -607,6 +1125,46 @@ index 169c46c..623a9f3 100644
    private:
      void extract_type_time();
      Tick _calculateTotalRuntimeFromIntervals(
+diff --git a/astra-sim/workload/Workload.cc b/astra-sim/workload/Workload.cc
+index 8b33979..1e6db3d 100644
+--- a/astra-sim/workload/Workload.cc
++++ b/astra-sim/workload/Workload.cc
+@@ -368,8 +368,33 @@ void Workload::issue_coll_comm(
+         collective_comm_node_id_map[fp->my_id] = node->id();
+         collective_comm_wrapper_map[fp->my_id] = fp;
+         fp->set_notifier(this, EventType::CollectiveCommunicationFinished);
+-    } else if (comm_type == ChakraCollectiveCommType::BROADCAST) {
+-        // TODO: implement broadcast, for now just replay
++    } else if (comm_type == ChakraCollectiveCommType::BROADCAST ||
++               comm_type == ChakraCollectiveCommType::REDUCE) {
++        // Broadcast and Reduce have no native ASTRA implementation.  When the
++        // system input registers a custom algorithm for this communicator we
++        // simulate it like any other custom collective; otherwise we keep the
++        // pre-existing behaviour of replaying the traced duration.
++        const ComType structural_type =
++            comm_type == ChakraCollectiveCommType::BROADCAST
++                ? ComType::Broadcast
++                : ComType::Reduce;
++        const std::vector<int> membership =
++            comm_group == nullptr ? sys->default_communicator()
++                                  : comm_group->involved_NPUs;
++        if (sys->collective_impl_lookup->has_custom_impl_for_communicator(
++                structural_type, node->id(), membership)) {
++            DataSet* fp =
++                structural_type == ComType::Broadcast
++                    ? sys->generate_broadcast(comm_size, involved_dims,
++                                              comm_group, comm_priority,
++                                              node->id())
++                    : sys->generate_reduce(comm_size, involved_dims, comm_group,
++                                           comm_priority, node->id());
++            collective_comm_node_id_map[fp->my_id] = node->id();
++            collective_comm_wrapper_map[fp->my_id] = fp;
++            fp->set_notifier(this, EventType::CollectiveCommunicationFinished);
++            return;
++        }
+         uint64_t runtime = 1ul;
+         if (node->runtime() != 0ul) {
+             // chakra runtimes are in microseconds and we should convert it into
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 new file mode 100644
 index 0000000..dd9defb
