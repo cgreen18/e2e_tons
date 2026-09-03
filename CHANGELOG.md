@@ -140,3 +140,24 @@ Brief implementation notes are appended here by each collaborating agent.
   sweep take most of a day. Added `tools/slurm/astra_build.sbatch` and
   `tools/slurm/chakra_rewrite.sbatch` so builds and whole-model trace rewrites
   stay off the login node.
+
+## 2026-09-03
+
+- **root:** Ran the 12-job real-Chakra-trace matrix (2 models x 3 topologies x
+  2 backends) as a SLURM array. ALL 12 FAILED with every rank reporting
+  "unreleased nodes" at exit and statistics `complete: false` -- a genuine
+  ASTRA-sim collective-scheduling deadlock while replaying real Chakra traces,
+  not a network/congestion artifact. Proof: all 6 MoE8x13B runs (every
+  topology, both backends) stall at the byte-identical simulated instant
+  (7047166462 ns) after exactly {ALL_GATHER: 1, BROADCAST: 3}; all 3 Llama7B
+  congestion_unaware runs stall after exactly {ALL_GATHER: 70, ALL_REDUCE: 5,
+  REDUCE_SCATTER: 40}, and the congestion_aware runs of the same model reach
+  the identical collective counts, only later in simulated time -- fully
+  deterministic and topology/backend-independent. Ruled out mismatched
+  process-group membership across ranks for Llama7B (not yet checked for
+  MoE8x13B). Each failed attempt cost 1.5-18.5 real hours before ASTRA-sim
+  reported the stall, so further repro must not be full 128-rank reruns.
+  Cancelled the (already-completed-as-failed) remaining array tasks and handed
+  root-causing to a dedicated investigation track
+  (codex/trace-deadlock-investigation) with the full evidence trail rather than
+  guessing. No trace-driven performance claim is possible until this is fixed.
